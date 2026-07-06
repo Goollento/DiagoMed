@@ -3,12 +3,21 @@ denoise_demo.py
 ---------------
 Proof-of-concept demonstration of biosignal denoising for inBiome.
 
-The script synthesises a clean physiological-like signal (e.g. a slow
-oscillation similar to a pulse-oximetry waveform plus a low-frequency
-baseline drift), corrupts it with realistic noise (white Gaussian noise,
-50 Hz mains interference and random spikes), and then recovers the
-underlying signal using a zero-phase low-pass Butterworth filter from
-SciPy. The three traces are plotted together for visual comparison.
+Pipeline
+--------
+1. Synthesise a clean physiological-like signal (a periodic oscillation,
+   similar to a pulse-oximetry waveform, plus slow baseline drift).
+2. Corrupt it with a realistic, layered noise model: white Gaussian noise,
+   1/f ("pink") drift-like noise, 50 Hz mains interference, short EMG-like
+   high-frequency bursts (muscle artefact) and motion-artefact pulses
+   (electrode pops / contact loss).
+3. Denoise in two stages:
+     a) Hampel filter  -> removes isolated outliers / spikes without
+        touching the rest of the waveform (a nonlinear, robust step).
+     b) Butterworth zero-phase low-pass -> removes the remaining
+        broadband/high-frequency noise (a linear, smoothing step).
+4. Quantify quality at every stage with SNR (dB) against the known
+   ground-truth clean signal.
 
 Author: portfolio / inBiome demonstration
 """
@@ -39,7 +48,7 @@ def generate_clean_signal(duration_s: float = 10.0,
     fs : int
         Sampling frequency in Hz.
     signal_freq : float
-        Frequency of the main oscillation in Hz (~1.2 Hz ≈ 72 bpm).
+        Frequency of the main oscillation in Hz (~1.2 Hz ~= 72 bpm).
 
     Returns
     -------
@@ -57,7 +66,7 @@ def generate_clean_signal(duration_s: float = 10.0,
     if signal_freq > 0.5 * fs:
         raise ValueError(
             f"signal_freq ({signal_freq} Hz) is above Nyquist "
-            f"({0.5 * fs} Hz) — aliasing would corrupt the signal"
+            f"({0.5 * fs} Hz) -- aliasing would corrupt the signal"
         )
 
     t = np.linspace(0.0, duration_s, int(duration_s * fs), endpoint=False)
@@ -67,26 +76,105 @@ def generate_clean_signal(duration_s: float = 10.0,
     return t, clean
 
 
+# ---------------------------------------------------------------------------
+# Noise components (composable, so the overall noise model is layered)
+# ---------------------------------------------------------------------------
+def _generate_pink_noise(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate unit-variance 1/f ("pink") noise via spectral shaping.
+
+    Pink noise is a reasonable stand-in for slow, correlated physiological
+    and electrode-drift noise that white Gaussian noise does not capture.
+    """
+    if n <= 1:
+        return np.zeros(n)
+    white = rng.normal(size=n)
+    spectrum = np.fft.rfft(white)
+    freqs = np.fft.rfftfreq(n)
+    freqs[0] = freqs[1]  # avoid division by zero at DC
+    spectrum = spectrum / np.sqrt(freqs)
+    pink = np.fft.irfft(spectrum, n)
+    std = np.std(pink)
+    if std > 0:
+        pink = pink / std
+    return pink
+
+
+def _generate_emg_bursts(n: int,
+                         fs: int,
+                         rng: np.random.Generator,
+                         burst_count: int,
+                         burst_duration_s: float,
+                         burst_amp: float) -> np.ndarray:
+    """Generate short bursts of high-frequency noise mimicking muscle (EMG)
+    artefact, e.g. from patient movement or shivering.
+    """
+    noise = np.zeros(n)
+    burst_len = int(burst_duration_s * fs)
+    if burst_count <= 0 or burst_len < 1 or n <= burst_len:
+        return noise
+
+    starts = rng.integers(low=0, high=n - burst_len, size=burst_count)
+    envelope = np.hanning(burst_len)
+    for start in starts:
+        burst = rng.normal(scale=burst_amp, size=burst_len) * envelope
+        noise[start:start + burst_len] += burst
+    return noise
+
+
+def _generate_motion_artifacts(n: int,
+                               rng: np.random.Generator,
+                               artifact_count: int,
+                               artifact_len_range: tuple[int, int],
+                               artifact_amp: float) -> np.ndarray:
+    """Generate rectangular-ish pulses mimicking motion artefacts / electrode
+    pops: short segments where the signal jumps to an offset value.
+    """
+    noise = np.zeros(n)
+    if artifact_count <= 0 or n == 0:
+        return noise
+
+    min_len, max_len = artifact_len_range
+    for _ in range(artifact_count):
+        length = int(rng.integers(low=min_len, high=max_len + 1))
+        if length < 1 or length >= n:
+            continue
+        start = int(rng.integers(low=0, high=n - length))
+        sign = rng.choice([-1.0, 1.0])
+        # Smooth-ish rectangular pulse (half-sine ramp in/out) so the
+        # Hampel filter sees it as a genuine run of outliers, not one spike.
+        ramp = np.hanning(length)
+        noise[start:start + length] += sign * artifact_amp * ramp
+    return noise
+
+
 def add_realistic_noise(clean: np.ndarray,
                         fs: int,
-                        gaussian_amp: float = 0.4,
+                        gaussian_amp: float = 0.3,
+                        pink_amp: float = 0.25,
                         mains_freq: float = 50.0,
-                        mains_amp: float = 0.25,
-                        spike_count: int = 8,
-                        spike_amp: float = 2.5,
+                        mains_amp: float = 0.2,
+                        emg_burst_count: int = 3,
+                        emg_burst_duration_s: float = 0.3,
+                        emg_burst_amp: float = 1.2,
+                        motion_artifact_count: int = 5,
+                        motion_artifact_len_range: tuple[int, int] = (3, 10),
+                        motion_artifact_amp: float = 2.2,
                         rng: np.random.Generator | None = None) -> np.ndarray:
-    """Add white Gaussian noise, mains interference and random spikes."""
+    """Corrupt a clean signal with a layered, more realistic noise model:
+    white Gaussian noise + 1/f pink noise + 50 Hz mains interference +
+    EMG-like high-frequency bursts + motion-artefact pulses.
+    """
     if fs <= 0:
         raise ValueError(f"fs must be positive, got {fs}")
-    if gaussian_amp < 0 or mains_amp < 0 or spike_amp < 0:
+    if min(gaussian_amp, pink_amp, mains_amp, emg_burst_amp, motion_artifact_amp) < 0:
         raise ValueError("noise amplitudes must be non-negative")
-    if spike_count < 0:
-        raise ValueError(f"spike_count must be non-negative, got {spike_count}")
+    if emg_burst_count < 0 or motion_artifact_count < 0:
+        raise ValueError("burst/artifact counts must be non-negative")
     if mains_freq < 0:
         raise ValueError(f"mains_freq must be non-negative, got {mains_freq}")
     if mains_freq > 0.5 * fs and mains_amp > 0:
         # Above Nyquist the mains sinusoid would alias to a different
-        # frequency — refuse rather than silently produce a misleading artefact.
+        # frequency -- refuse rather than silently produce a misleading artefact.
         raise ValueError(
             f"mains_freq ({mains_freq} Hz) is above Nyquist "
             f"({0.5 * fs} Hz); raise fs or set mains_amp=0"
@@ -99,40 +187,102 @@ def add_realistic_noise(clean: np.ndarray,
     t = np.arange(n) / fs
 
     gaussian = rng.normal(loc=0.0, scale=gaussian_amp, size=n)
+    pink = pink_amp * _generate_pink_noise(n, rng)
     mains = mains_amp * np.sin(2 * np.pi * mains_freq * t)
+    emg = _generate_emg_bursts(n, fs, rng, emg_burst_count,
+                               emg_burst_duration_s, emg_burst_amp)
+    motion = _generate_motion_artifacts(n, rng, motion_artifact_count,
+                                        motion_artifact_len_range,
+                                        motion_artifact_amp)
 
-    spikes = np.zeros(n)
-    if spike_count > 0 and n > 0:
-        spike_idx = rng.integers(low=0, high=n, size=spike_count)
-        spike_signs = rng.choice([-1.0, 1.0], size=spike_count)
-        spikes[spike_idx] = spike_signs * spike_amp
-
-    return clean + gaussian + mains + spikes
+    return clean + gaussian + pink + mains + emg + motion
 
 
 # ---------------------------------------------------------------------------
-# Denoising
+# Stage 1 of denoising: Hampel filter (robust outlier / spike removal)
+# ---------------------------------------------------------------------------
+def hampel_filter(signal: np.ndarray,
+                  window_size: int = 7,
+                  n_sigmas: float = 3.0) -> np.ndarray:
+    """Remove outliers/spikes with a sliding-window Hampel filter.
+
+    For each sample, the median and the Median Absolute Deviation (MAD) of a
+    surrounding window are computed. If a sample deviates from the local
+    median by more than `n_sigmas` scaled-MADs, it is replaced by the local
+    median. This is a robust, nonlinear step that targets isolated spikes
+    and short artefact runs (e.g. motion artefacts) without smoothing or
+    phase-shifting the rest of the waveform the way a linear filter would.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Input samples (typically the raw noisy signal).
+    window_size : int
+        Size of the sliding window in samples (should be odd; an even
+        value is rounded up internally).
+    n_sigmas : float
+        Rejection threshold in scaled-MAD units.
+
+    Returns
+    -------
+    np.ndarray
+        Signal with outliers replaced by local medians, same length as input.
+    """
+    signal = np.asarray(signal, dtype=float)
+    if signal.ndim != 1:
+        raise ValueError(f"signal must be 1-D, got shape {signal.shape}")
+    if window_size < 1:
+        raise ValueError(f"window_size must be positive, got {window_size}")
+    if n_sigmas <= 0:
+        raise ValueError(f"n_sigmas must be positive, got {n_sigmas}")
+
+    n = signal.size
+    if n == 0:
+        return signal.copy()
+
+    half_window = max(1, window_size // 2)
+    k = 1.4826  # scale factor so MAD approximates std for Gaussian data
+    cleaned = signal.copy()
+
+    for i in range(n):
+        start = max(0, i - half_window)
+        end = min(n, i + half_window + 1)
+        window = signal[start:end]
+        median = np.median(window)
+        mad = k * np.median(np.abs(window - median))
+        if mad == 0:
+            continue
+        if np.abs(signal[i] - median) > n_sigmas * mad:
+            cleaned[i] = median
+
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 of denoising: Butterworth zero-phase low-pass
 # ---------------------------------------------------------------------------
 def denoise_signal(noisy_signal: np.ndarray,
                    fs: int = 100,
                    cutoff_hz: float = 4.0,
                    order: int = 4) -> np.ndarray:
-    """Remove high-frequency noise with a zero-phase Butterworth low-pass.
+    """Remove remaining high-frequency/broadband noise with a zero-phase
+    Butterworth low-pass.
 
     A low-pass filter is well suited to physiological signals whose
     informative content lies below a few Hz (heart rate, respiration,
-    slow temperature changes), while the dominant noise sources
-    (mains hum at 50/60 Hz, spikes, broadband Gaussian noise) sit
-    above the chosen cutoff and are attenuated.
+    slow temperature changes), while the dominant remaining noise sources
+    (mains hum, EMG bursts, broadband Gaussian/pink noise) sit above the
+    chosen cutoff and are attenuated.
 
     `filtfilt` applies the filter forward and backward to avoid the
-    phase distortion that would shift the waveform in time — important
+    phase distortion that would shift the waveform in time -- important
     for diagnostic interpretation.
 
     Parameters
     ----------
     noisy_signal : np.ndarray
-        Input samples to be cleaned.
+        Input samples to be cleaned (ideally already passed through
+        `hampel_filter` to remove spikes first).
     fs : int
         Sampling frequency of `noisy_signal` in Hz.
     cutoff_hz : float
@@ -165,7 +315,7 @@ def denoise_signal(noisy_signal: np.ndarray,
         )
     if not np.all(np.isfinite(noisy_signal)):
         # filtfilt propagates a single NaN/Inf to every output sample.
-        raise ValueError("noisy_signal contains NaN or Inf — clean the input first")
+        raise ValueError("noisy_signal contains NaN or Inf -- clean the input first")
 
     padlen = 3 * (order + 1)
     if noisy_signal.size <= padlen:
@@ -182,15 +332,51 @@ def denoise_signal(noisy_signal: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Stage 3: quality metric (SNR)
+# ---------------------------------------------------------------------------
+def compute_snr_db(reference: np.ndarray, test_signal: np.ndarray) -> float:
+    """Compute the Signal-to-Noise Ratio, in dB, of `test_signal` against a
+    known ground-truth `reference`.
+
+    SNR = 10 * log10( power(reference) / power(reference - test_signal) )
+
+    Higher is better; this is the standard way to quantify how close a
+    denoised (or noisy) signal is to the ground truth when the ground
+    truth is known, as it is here since the clean signal was synthesised.
+    """
+    reference = np.asarray(reference, dtype=float)
+    test_signal = np.asarray(test_signal, dtype=float)
+    if reference.shape != test_signal.shape:
+        raise ValueError(
+            f"shape mismatch: reference {reference.shape} vs "
+            f"test_signal {test_signal.shape}"
+        )
+
+    noise = reference - test_signal
+    signal_power = np.mean(reference ** 2)
+    noise_power = np.mean(noise ** 2)
+
+    if noise_power == 0:
+        return float("inf")
+    return 10.0 * np.log10(signal_power / noise_power)
+
+
+# ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
 def plot_results(t: np.ndarray,
                  clean: np.ndarray,
                  noisy: np.ndarray,
-                 cleaned: np.ndarray,
+                 hampel_cleaned: np.ndarray,
+                 final_cleaned: np.ndarray,
+                 snr_noisy: float,
+                 snr_hampel: float,
+                 snr_final: float,
                  save_path: str | None = "denoise_demo.png") -> None:
-    """Plot the three traces stacked vertically and optionally save to disk."""
-    fig, axes = plt.subplots(3, 1, figsize=(11, 7), sharex=True)
+    """Plot clean / noisy / Hampel-stage / final-stage traces, annotated
+    with the SNR (dB) achieved at each stage, and optionally save to disk.
+    """
+    fig, axes = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
 
     axes[0].plot(t, clean, color="#1b7f3a", linewidth=1.4, label="Clean signal")
     axes[0].set_title("Clean synthetic biosignal (sine + baseline drift)")
@@ -199,23 +385,30 @@ def plot_results(t: np.ndarray,
     axes[0].grid(alpha=0.3)
 
     axes[1].plot(t, noisy, color="#b03030", linewidth=0.8,
-                 label="Noisy signal (Gaussian + 50 Hz + spikes)")
-    axes[1].set_title("Noisy signal")
+                 label="Noisy (Gaussian + pink + 50 Hz + EMG bursts + motion)")
+    axes[1].set_title(f"Noisy signal  |  SNR = {snr_noisy:.2f} dB")
     axes[1].set_ylabel("Amplitude (a.u.)")
     axes[1].legend(loc="upper right")
     axes[1].grid(alpha=0.3)
 
-    axes[2].plot(t, cleaned, color="#1f4ea1", linewidth=1.4,
-                 label="Cleaned signal (Butterworth low-pass, 4 Hz)")
-    axes[2].plot(t, clean, color="#1b7f3a", linewidth=1.0,
-                 linestyle="--", alpha=0.6, label="Reference (clean)")
-    axes[2].set_title("Recovered signal after denoising")
-    axes[2].set_xlabel("Time (s)")
+    axes[2].plot(t, hampel_cleaned, color="#c47f00", linewidth=0.9,
+                 label="After Hampel filter (spikes/artefacts removed)")
+    axes[2].set_title(f"Stage 1: Hampel filter  |  SNR = {snr_hampel:.2f} dB")
     axes[2].set_ylabel("Amplitude (a.u.)")
     axes[2].legend(loc="upper right")
     axes[2].grid(alpha=0.3)
 
-    fig.suptitle("Biosignal denoising demo — inBiome PoC",
+    axes[3].plot(t, final_cleaned, color="#1f4ea1", linewidth=1.4,
+                 label="After Hampel + Butterworth low-pass")
+    axes[3].plot(t, clean, color="#1b7f3a", linewidth=1.0,
+                 linestyle="--", alpha=0.6, label="Reference (clean)")
+    axes[3].set_title(f"Stage 2: Butterworth low-pass  |  SNR = {snr_final:.2f} dB")
+    axes[3].set_xlabel("Time (s)")
+    axes[3].set_ylabel("Amplitude (a.u.)")
+    axes[3].legend(loc="upper right")
+    axes[3].grid(alpha=0.3)
+
+    fig.suptitle("Biosignal denoising pipeline: Hampel -> Butterworth -> SNR  (inBiome PoC)",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
@@ -235,16 +428,22 @@ def main() -> None:
 
     t, clean = generate_clean_signal(duration_s=duration_s, fs=fs)
     noisy = add_realistic_noise(clean, fs=fs)
-    cleaned = denoise_signal(noisy, fs=fs, cutoff_hz=4.0, order=4)
 
-    # Quality metric: residual RMS error vs. the ground-truth signal.
-    rms_before = float(np.sqrt(np.mean((noisy - clean) ** 2)))
-    rms_after = float(np.sqrt(np.mean((cleaned - clean) ** 2)))
-    print(f"RMS error before denoising: {rms_before:.3f}")
-    print(f"RMS error after  denoising: {rms_after:.3f}")
-    print(f"Improvement factor:         {rms_before / rms_after:.2f}x")
+    # --- Denoising pipeline: Hampel -> Butterworth -> SNR ---
+    after_hampel = hampel_filter(noisy, window_size=7, n_sigmas=3.0)
+    final_cleaned = denoise_signal(after_hampel, fs=fs, cutoff_hz=4.0, order=4)
 
-    plot_results(t, clean, noisy, cleaned)
+    snr_noisy = compute_snr_db(clean, noisy)
+    snr_hampel = compute_snr_db(clean, after_hampel)
+    snr_final = compute_snr_db(clean, final_cleaned)
+
+    print(f"SNR of noisy signal:                 {snr_noisy:6.2f} dB")
+    print(f"SNR after Hampel filter:              {snr_hampel:6.2f} dB")
+    print(f"SNR after Hampel + Butterworth:        {snr_final:6.2f} dB")
+    print(f"Total improvement:                    {snr_final - snr_noisy:+.2f} dB")
+
+    plot_results(t, clean, noisy, after_hampel, final_cleaned,
+                snr_noisy, snr_hampel, snr_final)
 
 
 if __name__ == "__main__":
