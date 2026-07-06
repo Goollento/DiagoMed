@@ -36,10 +36,13 @@ denoising techniques.
    3. **Wavelet shrinkage** (soft threshold, shallow decomposition,
       `sym8`) — runs last, on the already-smoothed signal, to mop up
       any residual short, wideband motion/EMG bursts that survive the
-      first two stages. Running it last (rather than before
-      Butterworth) makes the shrinkage threshold much easier to
-      estimate correctly, since there's far less residual noise left
-      to confuse the noise-floor estimate.
+      first two stages. Its noise threshold is estimated from the
+      signal *before* Butterworth (which still has its high-frequency
+      content intact), then applied to shrink the coefficients of the
+      signal *after* Butterworth — decoupling "how noisy was this
+      signal" from "what do I shrink" avoids the threshold collapsing
+      to near-zero once Butterworth has already removed most of the
+      high-frequency energy.
 4. **Plots** the clean, noisy, and each denoising stage on a single
    figure and saves the result to `denoise_demo.png`.
 5. Prints the **SNR (dB)** against the known ground-truth clean signal
@@ -49,10 +52,10 @@ denoising techniques.
 The pipeline is encapsulated in four reusable functions:
 
 ```python
-hampel_filter(signal, window_size=5, n_sigmas=2.5)              -> np.ndarray
-denoise_signal(noisy_signal, fs=100, cutoff_hz=4.0, order=4)    -> np.ndarray
-wavelet_denoise(signal, wavelet="sym8", level=4, mode="soft")   -> np.ndarray
-compute_snr_db(reference, test_signal)                          -> float
+hampel_filter(signal, window_size=5, n_sigmas=2.5)                                  -> np.ndarray
+denoise_signal(noisy_signal, fs=100, cutoff_hz=4.0, order=4)                        -> np.ndarray
+wavelet_denoise(signal, noise_reference=None, wavelet="sym8", level=4, mode="soft") -> np.ndarray
+compute_snr_db(reference, test_signal)                                              -> float
 ```
 
 so the pipeline can be reused, reordered, or applied stage-by-stage on
@@ -142,17 +145,9 @@ Expected console output (values are deterministic — fixed RNG seed):
 SNR of noisy signal:                              3.49 dB
 SNR after Hampel filter:                           4.08 dB
 SNR after Hampel + Butterworth:                     8.10 dB
-SNR after Hampel + Butterworth + wavelet:            8.10 dB
-Total improvement:                               +4.61 dB
+SNR after Hampel + Butterworth + wavelet:            8.54 dB
+Total improvement:                               +5.05 dB
 ```
-
-Note: with the noise amplitudes used in this demo, the Butterworth
-stage already removes most of the motion/EMG residual on its own
-(their energy is concentrated well above the 4 Hz cutoff), so the
-wavelet stage's marginal SNR contribution here is small — this is
-expected, not a bug. Its effect becomes more visible when motion/EMG
-bursts are made longer or lower-frequency (closer to the passband),
-which is closer to some real-world artefact profiles.
 
 ---
 
@@ -216,11 +211,22 @@ the original ground truth (dashed) — they should be visually close.
     frequency (1.2 Hz) and well below the mains content.
 - **Wavelet shrinkage** runs last, over the already-smoothed signal,
   to mop up whatever short, wideband motion/EMG residual survived the
-  first two stages. Running it last (rather than before Butterworth)
-  keeps its noise-floor estimate small and reliable, since there's far
-  less residual energy left to confuse it — a wavelet stage run on a
-  still-noisy signal tends to over-shrink and distort the underlying
-  sine. Two parameters matter most in practice:
+  first two stages. Its **noise threshold**, however, is estimated
+  from `after_hampel` — the signal *before* Butterworth — rather than
+  from the signal it actually shrinks:
+  - By the time Butterworth has run, the finest wavelet detail
+    coefficients of the signal are mostly gone (that's the whole point
+    of the low-pass filter), so estimating the noise floor from the
+    post-Butterworth signal itself yields a threshold too small to
+    meaningfully shrink anything.
+  - Estimating sigma from the pre-Butterworth signal instead — which
+    still carries its full high-frequency noise character — gives an
+    honest measurement of "how noisy was this recording", which is
+    then used to threshold the coefficients of the post-Butterworth
+    signal — "what do I actually shrink". Keeping those two roles
+    separate is what lets the wavelet stage meaningfully suppress
+    residual burst energy instead of doing almost nothing.
+  Two parameters matter most for the shrinkage step itself:
   - **Soft thresholding** (not hard) — hard-thresholding zeroes
     coefficients outright and leaves small discontinuities in the
     reconstructed waveform, visible as jagged edges. Soft shrinks
@@ -230,15 +236,6 @@ the original ground truth (dashed) — they should be visually close.
     decomposing too deep starts folding the signal's own 1.2 Hz
     carrier into the detail coefficients, so shrinkage attenuates the
     physiological oscillation itself, not just the artefact bursts.
-
-With the noise amplitudes used in this demo, motion/EMG bursts are
-short enough (tens of milliseconds) that most of their energy already
-sits above the Butterworth cutoff and gets removed in stage 2 — so the
-wavelet stage's marginal SNR contribution here is small. That's an
-expected consequence of this particular noise profile, not a flaw in
-the approach; the wavelet stage earns its keep more clearly against
-longer or lower-frequency artefacts that partially overlap the
-physiological passband.
 
 For artefact sources this pipeline still cannot separate cleanly from
 the signal (e.g. large, sustained motion overlapping the physiological

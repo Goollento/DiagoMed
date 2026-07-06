@@ -25,7 +25,10 @@ Pipeline
         wideband motion/EMG bursts that neither a fixed local window
         (Hampel) nor a fixed frequency cutoff (Butterworth) fully
         removes. Running this last, on an already-smoothed signal,
-        makes the shrinkage threshold much easier to tune correctly.
+        makes the *shrinkage* itself easier to apply cleanly -- but
+        the noise *threshold* is estimated from the pre-Butterworth
+        signal, since Butterworth has already removed most of the
+        high-frequency content the threshold estimate needs.
 4. Quantify quality at every stage with SNR (dB) against the known
    ground-truth clean signal.
 
@@ -348,6 +351,7 @@ def denoise_signal(noisy_signal: np.ndarray,
 # Stage 3 of denoising: wavelet-domain denoising (residual motion/EMG bursts)
 # ---------------------------------------------------------------------------
 def wavelet_denoise(signal: np.ndarray,
+                    noise_reference: np.ndarray | None = None,
                     wavelet: str = "sym8",
                     level: int | None = 4,
                     mode: str = "soft") -> np.ndarray:
@@ -358,24 +362,42 @@ def wavelet_denoise(signal: np.ndarray,
     that point is short, wideband motion/EMG bursts -- exactly what a
     fixed-window filter (Hampel) or a fixed frequency cutoff (Butterworth)
     can't isolate on their own, since wavelet decomposition localizes
-    energy in time *and* frequency simultaneously. Running it last, on an
-    already-smoothed signal, also makes the shrinkage threshold far easier
-    to tune: less residual noise means a smaller, more reliable estimate
-    of the noise floor.
+    energy in time *and* frequency simultaneously.
 
     The signal is decomposed with a discrete wavelet transform, the detail
     (high-frequency) coefficients at each level are shrunk with a universal
-    (VisuShrink) threshold estimated from the finest-level noise, and the
-    signal is reconstructed. Soft-thresholding shrinks every coefficient
-    toward zero and is used here rather than hard-thresholding, which
-    zeroes coefficients outright and introduces small discontinuities
-    ("kinks") into the reconstructed waveform -- visible as jagged edges
-    on a physiological signal that should be smooth.
+    (VisuShrink) threshold, and the signal is reconstructed.
+    Soft-thresholding shrinks every coefficient toward zero and is used
+    here rather than hard-thresholding, which zeroes coefficients outright
+    and introduces small discontinuities ("kinks") into the reconstructed
+    waveform -- visible as jagged edges on a physiological signal that
+    should be smooth.
+
+    Threshold estimation is decoupled from what gets filtered: by the time
+    Butterworth has run, the finest wavelet detail coefficients of
+    `signal` are mostly gone, so estimating sigma from `signal` itself
+    yields a threshold too small to do anything useful (the noise floor
+    it's trying to measure has already been removed). Passing
+    `noise_reference` -- the signal *before* Butterworth (i.e. the output
+    of `hampel_filter`), which still has its high frequencies intact --
+    fixes this: sigma is estimated from `noise_reference`'s finest detail
+    coefficients, but that threshold is applied to `signal`'s own
+    coefficients for the actual shrinkage. This keeps the two roles
+    separate -- "how noisy was this signal" vs "what do I shrink" -- so
+    the threshold reflects the genuine noise floor instead of whatever
+    little is left after Butterworth.
 
     Parameters
     ----------
     signal : np.ndarray
-        Input samples (e.g. output of `denoise_signal`).
+        Input samples to denoise (e.g. output of `denoise_signal`).
+    noise_reference : np.ndarray or None
+        Signal to estimate the noise threshold from -- ideally one taken
+        before Butterworth (e.g. the output of `hampel_filter`), since it
+        still carries the high-frequency content the threshold estimate
+        needs. Must be the same length as `signal`. If None, `signal`
+        is used for both roles (matches the old, threshold-collapses-
+        after-Butterworth behaviour -- not recommended in this pipeline).
     wavelet : str
         Wavelet family. Smooth, symmetric wavelets such as "sym8", "sym4"
         or "db4" are preferred here: their shape is closer to a
@@ -405,6 +427,20 @@ def wavelet_denoise(signal: np.ndarray,
     if mode not in ("soft", "hard"):
         raise ValueError(f"mode must be 'soft' or 'hard', got {mode!r}")
 
+    if noise_reference is None:
+        noise_reference = signal
+    else:
+        noise_reference = np.asarray(noise_reference, dtype=float)
+        if noise_reference.ndim != 1:
+            raise ValueError(
+                f"noise_reference must be 1-D, got shape {noise_reference.shape}"
+            )
+        if noise_reference.shape != signal.shape:
+            raise ValueError(
+                f"noise_reference must match signal's shape: "
+                f"got {noise_reference.shape} vs signal {signal.shape}"
+            )
+
     n = signal.size
     if n == 0:
         return signal.copy()
@@ -424,10 +460,14 @@ def wavelet_denoise(signal: np.ndarray,
     coeffs = pywt.wavedec(signal, wavelet, level=level)
     detail_coeffs = coeffs[1:]
 
-    # Universal (VisuShrink) threshold: noise sigma estimated robustly from
-    # the finest-detail coefficients via MAD, threshold = sigma * sqrt(2 ln n).
-    finest_detail = detail_coeffs[-1]
-    sigma = np.median(np.abs(finest_detail)) / 0.6745 if finest_detail.size else 0.0
+    # Universal (VisuShrink) threshold: noise sigma estimated robustly, via
+    # MAD, from the finest-detail coefficients of the *reference* signal
+    # (pre-Butterworth), threshold = sigma * sqrt(2 ln n). This is the
+    # only place `noise_reference` is used -- the shrinkage itself still
+    # operates on `signal`'s own coefficients below.
+    ref_coeffs = pywt.wavedec(noise_reference, wavelet, level=level)
+    finest_ref_detail = ref_coeffs[-1]
+    sigma = np.median(np.abs(finest_ref_detail)) / 0.6745 if finest_ref_detail.size else 0.0
     uthresh = sigma * np.sqrt(2.0 * np.log(n)) if sigma > 0 else 0.0
 
     denoised_coeffs = [coeffs[0]] + [
@@ -557,9 +597,14 @@ def main() -> None:
     # residual motion/EMG bursts. Shallow decomposition (level=4) and a
     # smooth mother wavelet (sym8) avoid folding the 1.2 Hz carrier into
     # the shrunk coefficients; soft thresholding avoids the discontinuities
-    # hard thresholding leaves in the waveform.
-    final_cleaned = wavelet_denoise(after_butterworth, wavelet="sym8",
-                                    level=4, mode="soft")
+    # hard thresholding leaves in the waveform. The noise threshold is
+    # estimated from `after_hampel` (pre-Butterworth), not from the signal
+    # being shrunk itself -- by the time Butterworth has run, the finest
+    # detail coefficients are mostly gone, so measuring the noise floor
+    # from the already-smoothed signal would yield a threshold too small
+    # to do anything.
+    final_cleaned = wavelet_denoise(after_butterworth, noise_reference=after_hampel,
+                                    wavelet="sym8", level=4, mode="soft")
 
     snr_noisy = compute_snr_db(clean, noisy)
     snr_hampel = compute_snr_db(clean, after_hampel)
