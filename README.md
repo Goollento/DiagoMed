@@ -5,7 +5,8 @@ biological signal (such as a pulse-oximetry waveform or a slow temperature
 trace) can be recovered using a layered, classical digital-filtering
 pipeline.
 
-This repository was created as a portfolio piece for **inBiome**.
+This repository is a personal pet project exploring classical biosignal
+denoising techniques.
 
 ---
 
@@ -223,5 +224,4 @@ MIT — feel free to reuse for educational or evaluation purposes.
 
 ---
 
-*This repository is a demonstration project prepared for the
-**Scientific Engineer** role at **inBiome**.*
+*This repository is a personal demonstration/learning project.*

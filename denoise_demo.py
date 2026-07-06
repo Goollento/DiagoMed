@@ -1,7 +1,7 @@
 """
 denoise_demo.py
 ---------------
-Proof-of-concept demonstration of biosignal denoising for inBiome.
+Personal proof-of-concept demonstration of biosignal denoising.
 
 Pipeline
 --------
@@ -26,7 +26,7 @@ Pipeline
 4. Quantify quality at every stage with SNR (dB) against the known
    ground-truth clean signal.
 
-Author: portfolio / inBiome demonstration
+Author: personal pet project
 """
 
 from __future__ import annotations
@@ -509,7 +509,7 @@ def plot_results(t: np.ndarray,
     axes[4].legend(loc="upper right")
     axes[4].grid(alpha=0.3)
 
-    fig.suptitle("Biosignal denoising pipeline: Hampel -> Wavelet -> Butterworth -> SNR  (inBiome PoC)",
+    fig.suptitle("Biosignal denoising pipeline: Hampel -> Wavelet -> Butterworth -> SNR",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
