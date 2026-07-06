@@ -15,14 +15,17 @@ Pipeline
      a) Hampel filter -> removes isolated outliers / spikes (motion
         artefacts, electrode pops) without touching the rest of the
         waveform (a nonlinear, robust step).
-     b) Wavelet shrinkage (VisuShrink, soft threshold) -> isolates
-        short, wideband bursts (residual motion/EMG artefact) in the
-        time-frequency domain, which a fixed-window Hampel filter and a
-        fixed-cutoff Butterworth filter both miss on their own.
-     c) Butterworth zero-phase low-pass (`filtfilt`, not `lfilter`) ->
-        removes the remaining broadband/high-frequency noise with no
-        phase distortion -- safe here since this is offline
-        post-processing, not a real-time/streaming pipeline.
+     b) Butterworth zero-phase low-pass (`filtfilt`, not `lfilter`) ->
+        removes the bulk of the broadband/high-frequency noise (50 Hz
+        mains, white Gaussian) with no phase distortion -- safe here
+        since this is offline post-processing, not a real-time/
+        streaming pipeline.
+     c) Wavelet shrinkage (soft threshold, shallow decomposition) ->
+        isolates what's left after the first two stages: short,
+        wideband motion/EMG bursts that neither a fixed local window
+        (Hampel) nor a fixed frequency cutoff (Butterworth) fully
+        removes. Running this last, on an already-smoothed signal,
+        makes the shrinkage threshold much easier to tune correctly.
 4. Quantify quality at every stage with SNR (dB) against the known
    ground-truth clean signal.
 
@@ -267,103 +270,22 @@ def hampel_filter(signal: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 of denoising: wavelet-domain denoising (motion-artefact / EMG bursts)
-# ---------------------------------------------------------------------------
-def wavelet_denoise(signal: np.ndarray,
-                    wavelet: str = "db6",
-                    level: int | None = None,
-                    mode: str = "soft") -> np.ndarray:
-    """Denoise via multi-resolution wavelet shrinkage (VisuShrink-style).
-
-    Hampel and Butterworth are both "global" in a sense: Hampel only sees a
-    fixed-size local window, and Butterworth applies the same frequency
-    cutoff everywhere in time. Neither of them isolates a burst of motion
-    artefact / EMG noise that spans a wide range of frequencies over a
-    short time window -- that is exactly what wavelet decomposition is
-    good at, since it separates the signal into localized time-frequency
-    components.
-
-    The signal is decomposed with a discrete wavelet transform, the detail
-    (high-frequency) coefficients at each level are shrunk with a universal
-    (VisuShrink) threshold estimated from the finest-level noise, and the
-    signal is reconstructed. Soft-thresholding shrinks every coefficient
-    toward zero (denoising the whole record); it does not "cut out" a time
-    segment the way notching a channel would -- for that you'd want a
-    reference-based method (adaptive filtering / ICA), which needs an
-    extra noise-reference channel this single-channel demo does not have.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        Input samples (e.g. output of `hampel_filter`).
-    wavelet : str
-        Wavelet family (e.g. "db6", "sym8", "coif4").
-    level : int or None
-        Decomposition depth. None picks the maximum sensible depth for the
-        given signal length and wavelet.
-    mode : str
-        Thresholding mode passed to `pywt.threshold` ("soft" or "hard").
-        Soft is preferred: it avoids the discontinuities hard-thresholding
-        introduces, which matter for a physiological waveform.
-
-    Returns
-    -------
-    np.ndarray
-        Denoised signal, same length as input.
-    """
-    signal = np.asarray(signal, dtype=float)
-    if signal.ndim != 1:
-        raise ValueError(f"signal must be 1-D, got shape {signal.shape}")
-    if mode not in ("soft", "hard"):
-        raise ValueError(f"mode must be 'soft' or 'hard', got {mode!r}")
-
-    n = signal.size
-    if n == 0:
-        return signal.copy()
-
-    max_level = pywt.dwt_max_level(n, pywt.Wavelet(wavelet).dec_len)
-    if max_level < 1:
-        raise ValueError(
-            f"signal length ({n}) is too short for wavelet '{wavelet}'"
-        )
-    if level is None:
-        level = max_level
-    elif not 1 <= level <= max_level:
-        raise ValueError(
-            f"level must be in [1, {max_level}] for this signal/wavelet, got {level}"
-        )
-
-    coeffs = pywt.wavedec(signal, wavelet, level=level)
-    detail_coeffs = coeffs[1:]
-
-    # Universal (VisuShrink) threshold: noise sigma estimated robustly from
-    # the finest-detail coefficients via MAD, threshold = sigma * sqrt(2 ln n).
-    finest_detail = detail_coeffs[-1]
-    sigma = np.median(np.abs(finest_detail)) / 0.6745 if finest_detail.size else 0.0
-    uthresh = sigma * np.sqrt(2.0 * np.log(n)) if sigma > 0 else 0.0
-
-    denoised_coeffs = [coeffs[0]] + [
-        pywt.threshold(c, value=uthresh, mode=mode) for c in detail_coeffs
-    ]
-    denoised = pywt.waverec(denoised_coeffs, wavelet)
-    return denoised[:n]  # waverec can pad by 1 sample depending on length parity
-
-
-# ---------------------------------------------------------------------------
-# Stage 3 of denoising: Butterworth zero-phase low-pass
+# Stage 2 of denoising: Butterworth zero-phase low-pass
 # ---------------------------------------------------------------------------
 def denoise_signal(noisy_signal: np.ndarray,
                    fs: int = 100,
                    cutoff_hz: float = 4.0,
                    order: int = 4) -> np.ndarray:
-    """Remove remaining high-frequency/broadband noise with a zero-phase
-    Butterworth low-pass.
+    """Remove the bulk of the broadband/high-frequency noise with a
+    zero-phase Butterworth low-pass.
 
     A low-pass filter is well suited to physiological signals whose
     informative content lies below a few Hz (heart rate, respiration,
     slow temperature changes), while the dominant remaining noise sources
-    (mains hum, EMG bursts, broadband Gaussian/pink noise) sit above the
-    chosen cutoff and are attenuated.
+    (mains hum, broadband Gaussian/pink noise) sit above the
+    chosen cutoff and are attenuated. Short motion/EMG bursts are only
+    partially reduced here -- that's left for the wavelet stage that
+    follows, which is much easier to tune on an already-smoothed signal.
 
     `filtfilt` applies the filter forward and backward to avoid the
     phase distortion that would shift the waveform in time -- important
@@ -423,6 +345,99 @@ def denoise_signal(noisy_signal: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Stage 3 of denoising: wavelet-domain denoising (residual motion/EMG bursts)
+# ---------------------------------------------------------------------------
+def wavelet_denoise(signal: np.ndarray,
+                    wavelet: str = "sym8",
+                    level: int | None = 4,
+                    mode: str = "soft") -> np.ndarray:
+    """Denoise via multi-resolution wavelet shrinkage (VisuShrink-style).
+
+    Run last in the pipeline, after Hampel and Butterworth have already
+    removed spikes and the bulk of the broadband noise. What's left at
+    that point is short, wideband motion/EMG bursts -- exactly what a
+    fixed-window filter (Hampel) or a fixed frequency cutoff (Butterworth)
+    can't isolate on their own, since wavelet decomposition localizes
+    energy in time *and* frequency simultaneously. Running it last, on an
+    already-smoothed signal, also makes the shrinkage threshold far easier
+    to tune: less residual noise means a smaller, more reliable estimate
+    of the noise floor.
+
+    The signal is decomposed with a discrete wavelet transform, the detail
+    (high-frequency) coefficients at each level are shrunk with a universal
+    (VisuShrink) threshold estimated from the finest-level noise, and the
+    signal is reconstructed. Soft-thresholding shrinks every coefficient
+    toward zero and is used here rather than hard-thresholding, which
+    zeroes coefficients outright and introduces small discontinuities
+    ("kinks") into the reconstructed waveform -- visible as jagged edges
+    on a physiological signal that should be smooth.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Input samples (e.g. output of `denoise_signal`).
+    wavelet : str
+        Wavelet family. Smooth, symmetric wavelets such as "sym8", "sym4"
+        or "db4" are preferred here: their shape is closer to a
+        physiological waveform than sharper wavelets like "db2" or "haar",
+        so they distort the underlying sine less while still catching
+        transient bursts.
+    level : int or None
+        Decomposition depth. Kept shallow (3-5) by default: decomposing
+        too deep starts to fold the signal's own carrier frequency into
+        the detail coefficients, so shrinkage ends up attenuating the
+        physiological oscillation itself, not just the artefact bursts.
+        None falls back to the maximum depth the signal length and
+        wavelet support (not recommended for this reason).
+    mode : str
+        Thresholding mode passed to `pywt.threshold` ("soft" or "hard").
+        Soft is preferred: it avoids the discontinuities hard-thresholding
+        introduces, which matter for a physiological waveform.
+
+    Returns
+    -------
+    np.ndarray
+        Denoised signal, same length as input.
+    """
+    signal = np.asarray(signal, dtype=float)
+    if signal.ndim != 1:
+        raise ValueError(f"signal must be 1-D, got shape {signal.shape}")
+    if mode not in ("soft", "hard"):
+        raise ValueError(f"mode must be 'soft' or 'hard', got {mode!r}")
+
+    n = signal.size
+    if n == 0:
+        return signal.copy()
+
+    max_level = pywt.dwt_max_level(n, pywt.Wavelet(wavelet).dec_len)
+    if max_level < 1:
+        raise ValueError(
+            f"signal length ({n}) is too short for wavelet '{wavelet}'"
+        )
+    if level is None:
+        level = max_level
+    elif not 1 <= level <= max_level:
+        raise ValueError(
+            f"level must be in [1, {max_level}] for this signal/wavelet, got {level}"
+        )
+
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
+    detail_coeffs = coeffs[1:]
+
+    # Universal (VisuShrink) threshold: noise sigma estimated robustly from
+    # the finest-detail coefficients via MAD, threshold = sigma * sqrt(2 ln n).
+    finest_detail = detail_coeffs[-1]
+    sigma = np.median(np.abs(finest_detail)) / 0.6745 if finest_detail.size else 0.0
+    uthresh = sigma * np.sqrt(2.0 * np.log(n)) if sigma > 0 else 0.0
+
+    denoised_coeffs = [coeffs[0]] + [
+        pywt.threshold(c, value=uthresh, mode=mode) for c in detail_coeffs
+    ]
+    denoised = pywt.waverec(denoised_coeffs, wavelet)
+    return denoised[:n]  # waverec can pad by 1 sample depending on length parity
+
+
+# ---------------------------------------------------------------------------
 # Stage 4: quality metric (SNR)
 # ---------------------------------------------------------------------------
 def compute_snr_db(reference: np.ndarray, test_signal: np.ndarray) -> float:
@@ -459,16 +474,16 @@ def plot_results(t: np.ndarray,
                  clean: np.ndarray,
                  noisy: np.ndarray,
                  hampel_cleaned: np.ndarray,
-                 wavelet_cleaned: np.ndarray,
+                 butterworth_cleaned: np.ndarray,
                  final_cleaned: np.ndarray,
                  snr_noisy: float,
                  snr_hampel: float,
-                 snr_wavelet: float,
+                 snr_butterworth: float,
                  snr_final: float,
                  save_path: str | None = "denoise_demo.png") -> None:
-    """Plot clean / noisy / Hampel-stage / wavelet-stage / final-stage traces,
-    annotated with the SNR (dB) achieved at each stage, and optionally save
-    to disk.
+    """Plot clean / noisy / Hampel-stage / Butterworth-stage / final-stage
+    (wavelet) traces, annotated with the SNR (dB) achieved at each stage,
+    and optionally save to disk.
     """
     fig, axes = plt.subplots(5, 1, figsize=(11, 11), sharex=True)
 
@@ -492,24 +507,24 @@ def plot_results(t: np.ndarray,
     axes[2].legend(loc="upper right")
     axes[2].grid(alpha=0.3)
 
-    axes[3].plot(t, wavelet_cleaned, color="#7a3fa0", linewidth=0.9,
-                 label="After wavelet shrinkage (motion/EMG isolated)")
-    axes[3].set_title(f"Stage 2: Wavelet denoising  |  SNR = {snr_wavelet:.2f} dB")
+    axes[3].plot(t, butterworth_cleaned, color="#1f4ea1", linewidth=0.9,
+                 label="After Butterworth low-pass (bulk noise removed)")
+    axes[3].set_title(f"Stage 2: Butterworth low-pass (zero-phase)  |  SNR = {snr_butterworth:.2f} dB")
     axes[3].set_ylabel("Amplitude (a.u.)")
     axes[3].legend(loc="upper right")
     axes[3].grid(alpha=0.3)
 
-    axes[4].plot(t, final_cleaned, color="#1f4ea1", linewidth=1.4,
-                 label="After Hampel + wavelet + Butterworth low-pass")
+    axes[4].plot(t, final_cleaned, color="#7a3fa0", linewidth=1.4,
+                 label="After Hampel + Butterworth + wavelet shrinkage")
     axes[4].plot(t, clean, color="#1b7f3a", linewidth=1.0,
                  linestyle="--", alpha=0.6, label="Reference (clean)")
-    axes[4].set_title(f"Stage 3: Butterworth low-pass (zero-phase)  |  SNR = {snr_final:.2f} dB")
+    axes[4].set_title(f"Stage 3: Wavelet shrinkage  |  SNR = {snr_final:.2f} dB")
     axes[4].set_xlabel("Time (s)")
     axes[4].set_ylabel("Amplitude (a.u.)")
     axes[4].legend(loc="upper right")
     axes[4].grid(alpha=0.3)
 
-    fig.suptitle("Biosignal denoising pipeline: Hampel -> Wavelet -> Butterworth -> SNR",
+    fig.suptitle("Biosignal denoising pipeline: Hampel -> Butterworth -> Wavelet -> SNR",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
@@ -530,29 +545,35 @@ def main() -> None:
     t, clean = generate_clean_signal(duration_s=duration_s, fs=fs)
     noisy = add_realistic_noise(clean, fs=fs)
 
-    # --- Denoising pipeline: Hampel -> wavelet -> Butterworth -> SNR ---
+    # --- Denoising pipeline: Hampel -> Butterworth -> Wavelet -> SNR ---
     # Hampel tuned tighter (smaller window, lower sigma threshold) so it
     # cuts spikes/motion artefacts harder before anything else runs.
     after_hampel = hampel_filter(noisy, window_size=5, n_sigmas=2.5)
-    after_wavelet = wavelet_denoise(after_hampel, wavelet="db6", mode="soft")
     # filtfilt is zero-phase (forward+backward), so this stage introduces
     # no time shift -- safe to use here since this is offline post-processing,
     # not a real-time/streaming pipeline.
-    final_cleaned = denoise_signal(after_wavelet, fs=fs, cutoff_hz=4.0, order=4)
+    after_butterworth = denoise_signal(after_hampel, fs=fs, cutoff_hz=4.0, order=4)
+    # Wavelet runs last, on the already-smoothed signal, targeting the
+    # residual motion/EMG bursts. Shallow decomposition (level=4) and a
+    # smooth mother wavelet (sym8) avoid folding the 1.2 Hz carrier into
+    # the shrunk coefficients; soft thresholding avoids the discontinuities
+    # hard thresholding leaves in the waveform.
+    final_cleaned = wavelet_denoise(after_butterworth, wavelet="sym8",
+                                    level=4, mode="soft")
 
     snr_noisy = compute_snr_db(clean, noisy)
     snr_hampel = compute_snr_db(clean, after_hampel)
-    snr_wavelet = compute_snr_db(clean, after_wavelet)
+    snr_butterworth = compute_snr_db(clean, after_butterworth)
     snr_final = compute_snr_db(clean, final_cleaned)
 
-    print(f"SNR of noisy signal:                         {snr_noisy:6.2f} dB")
-    print(f"SNR after Hampel filter:                      {snr_hampel:6.2f} dB")
-    print(f"SNR after Hampel + wavelet:                    {snr_wavelet:6.2f} dB")
-    print(f"SNR after Hampel + wavelet + Butterworth:       {snr_final:6.2f} dB")
-    print(f"Total improvement:                            {snr_final - snr_noisy:+.2f} dB")
+    print(f"SNR of noisy signal:                            {snr_noisy:6.2f} dB")
+    print(f"SNR after Hampel filter:                         {snr_hampel:6.2f} dB")
+    print(f"SNR after Hampel + Butterworth:                   {snr_butterworth:6.2f} dB")
+    print(f"SNR after Hampel + Butterworth + wavelet:          {snr_final:6.2f} dB")
+    print(f"Total improvement:                               {snr_final - snr_noisy:+.2f} dB")
 
-    plot_results(t, clean, noisy, after_hampel, after_wavelet, final_cleaned,
-                snr_noisy, snr_hampel, snr_wavelet, snr_final)
+    plot_results(t, clean, noisy, after_hampel, after_butterworth, final_cleaned,
+                snr_noisy, snr_hampel, snr_butterworth, snr_final)
 
 
 if __name__ == "__main__":
