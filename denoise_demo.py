@@ -5,30 +5,38 @@ Personal proof-of-concept demonstration of biosignal denoising.
 
 Pipeline
 --------
+This mirrors how real ECG/PPG/EEG pipelines are usually built: repair
+corrupted samples *before* any linear filtering runs, so the linear
+filters don't "ring" on sharp discontinuities.
+
 1. Synthesise a clean physiological-like signal (a periodic oscillation,
    similar to a pulse-oximetry waveform, plus slow baseline drift).
 2. Corrupt it with a realistic, layered noise model: white Gaussian noise,
    1/f ("pink") drift-like noise, 50 Hz mains interference, short EMG-like
-   high-frequency bursts (muscle artefact) and motion-artefact pulses
-   (electrode pops / contact loss).
-3. Denoise in three stages:
-     a) Hampel filter -> removes isolated outliers / spikes (motion
-        artefacts, electrode pops) without touching the rest of the
-        waveform (a nonlinear, robust step).
-     b) Butterworth zero-phase low-pass (`filtfilt`, not `lfilter`) ->
-        removes the bulk of the broadband/high-frequency noise (50 Hz
-        mains, white Gaussian) with no phase distortion -- safe here
-        since this is offline post-processing, not a real-time/
-        streaming pipeline.
-     c) Wavelet shrinkage (soft threshold, shallow decomposition) ->
-        isolates what's left after the first two stages: short,
-        wideband motion/EMG bursts that neither a fixed local window
-        (Hampel) nor a fixed frequency cutoff (Butterworth) fully
-        removes. Running this last, on an already-smoothed signal,
-        makes the *shrinkage* itself easier to apply cleanly -- but
-        the noise *threshold* is estimated from the pre-Butterworth
-        signal, since Butterworth has already removed most of the
-        high-frequency content the threshold estimate needs.
+   high-frequency bursts (muscle artefact), abrupt baseline shifts
+   (electrode/motion artefact), brief signal dropouts (contact loss), and
+   sensor clipping (ADC saturation).
+3. Repair, then filter, in five stages:
+     a) Hampel mask -> flag isolated outlier samples (median + MAD in a
+        sliding window) without altering anything yet.
+     b) Mask dilation -> grow each flagged region a few samples in each
+        direction, since a real artefact usually corrupts a short
+        neighbourhood, not just the single most extreme sample.
+     c) PCHIP interpolation -> replace every flagged sample by
+        interpolating from the surrounding good samples. Repairing first
+        means the linear filters that follow never see a hard
+        discontinuity to ring on.
+     d) Notch filter (50 Hz) -> removes mains interference specifically,
+        rather than relying on the low-pass roll-off alone.
+     e) Butterworth zero-phase band-pass (`filtfilt`, not `lfilter`) ->
+        removes the bulk of the remaining broadband noise, above *and*
+        below the physiological band -- this also removes the 0.05 Hz
+        baseline drift, which is treated here as slow artefact, not
+        signal.
+     f) Wavelet shrinkage (soft threshold, shallow decomposition) -> mops
+        up whatever short, wideband residue survives the previous
+        stages, using a noise-floor estimate taken from the
+        pre-filtering (post-interpolation) signal.
 4. Quantify quality at every stage with SNR (dB) against the known
    ground-truth clean signal.
 
@@ -40,7 +48,9 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 import pywt
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, iirnotch
+from scipy.ndimage import binary_dilation
+from scipy.interpolate import PchipInterpolator
 
 
 # ---------------------------------------------------------------------------
@@ -135,30 +145,63 @@ def _generate_emg_bursts(n: int,
     return noise
 
 
-def _generate_motion_artifacts(n: int,
-                               rng: np.random.Generator,
-                               artifact_count: int,
-                               artifact_len_range: tuple[int, int],
-                               artifact_amp: float) -> np.ndarray:
-    """Generate rectangular-ish pulses mimicking motion artefacts / electrode
-    pops: short segments where the signal jumps to an offset value.
+def _generate_baseline_shifts(n: int,
+                              fs: int,
+                              rng: np.random.Generator,
+                              shift_count: int,
+                              shift_len_range_s: tuple[float, float],
+                              shift_amp: float) -> np.ndarray:
+    """Generate abrupt, rectangular baseline-level shifts.
+
+    Models the sudden DC offset caused by electrode/sensor movement: the
+    signal jumps to a new level and holds there for a short duration. The
+    edges are deliberately *not* tapered (unlike the EMG bursts) --
+    sharpness here is the point: it's exactly the kind of discontinuity
+    a linear filter rings on, and what the Hampel-mask + interpolation
+    stage is meant to repair before any filtering happens.
     """
     noise = np.zeros(n)
-    if artifact_count <= 0 or n == 0:
+    if shift_count <= 0 or n == 0:
         return noise
 
-    min_len, max_len = artifact_len_range
-    for _ in range(artifact_count):
-        length = int(rng.integers(low=min_len, high=max_len + 1))
-        if length < 1 or length >= n:
-            continue
-        start = int(rng.integers(low=0, high=n - length))
+    min_s, max_s = shift_len_range_s
+    for _ in range(shift_count):
+        length = int(rng.uniform(min_s, max_s) * fs)
+        length = max(1, min(length, n))
+        start = int(rng.integers(low=0, high=n - length + 1))
         sign = rng.choice([-1.0, 1.0])
-        # Smooth-ish rectangular pulse (half-sine ramp in/out) so the
-        # Hampel filter sees it as a genuine run of outliers, not one spike.
-        ramp = np.hanning(length)
-        noise[start:start + length] += sign * artifact_amp * ramp
+        noise[start:start + length] += sign * shift_amp
     return noise
+
+
+def _apply_dropouts(signal: np.ndarray,
+                    fs: int,
+                    rng: np.random.Generator,
+                    dropout_count: int,
+                    dropout_len_range_s: tuple[float, float],
+                    flatline_noise_amp: float) -> np.ndarray:
+    """Simulate brief signal dropouts (contact loss / sensor disconnect).
+
+    Rather than attenuating the existing waveform, each dropout window is
+    replaced with a near-flat line (the value at the start of the dropout
+    plus a little residual electronic noise) -- closer to what a real
+    disconnected sensor produces than a scaled-down copy of the signal.
+    """
+    signal = signal.copy()
+    n = signal.size
+    if dropout_count <= 0 or n == 0:
+        return signal
+
+    min_s, max_s = dropout_len_range_s
+    for _ in range(dropout_count):
+        length = int(rng.uniform(min_s, max_s) * fs)
+        length = max(1, min(length, n))
+        start = int(rng.integers(low=0, high=n - length + 1))
+        hold_value = signal[start]
+        signal[start:start + length] = (
+            hold_value + rng.normal(scale=flatline_noise_amp, size=length)
+        )
+    return signal
 
 
 def add_realistic_noise(clean: np.ndarray,
@@ -170,20 +213,32 @@ def add_realistic_noise(clean: np.ndarray,
                         emg_burst_count: int = 3,
                         emg_burst_duration_s: float = 0.3,
                         emg_burst_amp: float = 1.2,
-                        motion_artifact_count: int = 5,
-                        motion_artifact_len_range: tuple[int, int] = (3, 10),
-                        motion_artifact_amp: float = 2.2,
+                        baseline_shift_count: int = 3,
+                        baseline_shift_len_range_s: tuple[float, float] = (0.15, 0.4),
+                        baseline_shift_amp: float = 1.5,
+                        dropout_count: int = 3,
+                        dropout_len_range_s: tuple[float, float] = (0.1, 0.3),
+                        dropout_flatline_noise_amp: float = 0.02,
+                        clip_limit: float | None = 3.0,
                         rng: np.random.Generator | None = None) -> np.ndarray:
-    """Corrupt a clean signal with a layered, more realistic noise model:
-    white Gaussian noise + 1/f pink noise + 50 Hz mains interference +
-    EMG-like high-frequency bursts + motion-artefact pulses.
+    """Corrupt a clean signal with a layered, realistic noise model: white
+    Gaussian noise + 1/f pink noise + 50 Hz mains interference + EMG-like
+    high-frequency bursts + abrupt baseline shifts + brief dropouts +
+    sensor clipping.
+
+    Baseline shifts, dropouts and clipping replace what used to be smooth,
+    Hann-windowed "motion artefact" pulses: real motion/contact artefacts
+    tend to look like sharp level jumps, flatlines, or railed peaks rather
+    than smooth bumps, and a repair-then-filter pipeline is specifically
+    meant to be tested against discontinuities like these.
     """
     if fs <= 0:
         raise ValueError(f"fs must be positive, got {fs}")
-    if min(gaussian_amp, pink_amp, mains_amp, emg_burst_amp, motion_artifact_amp) < 0:
+    if min(gaussian_amp, pink_amp, mains_amp, emg_burst_amp,
+          baseline_shift_amp) < 0:
         raise ValueError("noise amplitudes must be non-negative")
-    if emg_burst_count < 0 or motion_artifact_count < 0:
-        raise ValueError("burst/artifact counts must be non-negative")
+    if emg_burst_count < 0 or baseline_shift_count < 0 or dropout_count < 0:
+        raise ValueError("burst/shift/dropout counts must be non-negative")
     if mains_freq < 0:
         raise ValueError(f"mains_freq must be non-negative, got {mains_freq}")
     if mains_freq > 0.5 * fs and mains_amp > 0:
@@ -205,27 +260,38 @@ def add_realistic_noise(clean: np.ndarray,
     mains = mains_amp * np.sin(2 * np.pi * mains_freq * t)
     emg = _generate_emg_bursts(n, fs, rng, emg_burst_count,
                                emg_burst_duration_s, emg_burst_amp)
-    motion = _generate_motion_artifacts(n, rng, motion_artifact_count,
-                                        motion_artifact_len_range,
-                                        motion_artifact_amp)
+    baseline = _generate_baseline_shifts(n, fs, rng, baseline_shift_count,
+                                         baseline_shift_len_range_s,
+                                         baseline_shift_amp)
 
-    return clean + gaussian + pink + mains + emg + motion
+    noisy = clean + gaussian + pink + mains + emg + baseline
+
+    noisy = _apply_dropouts(noisy, fs, rng, dropout_count,
+                            dropout_len_range_s, dropout_flatline_noise_amp)
+
+    if clip_limit is not None:
+        if clip_limit <= 0:
+            raise ValueError(f"clip_limit must be positive, got {clip_limit}")
+        noisy = np.clip(noisy, -clip_limit, clip_limit)
+
+    return noisy
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 of denoising: Hampel filter (robust outlier / spike removal)
+# Stage 1 of the pipeline: Hampel outlier mask (detection only, no repair)
 # ---------------------------------------------------------------------------
-def hampel_filter(signal: np.ndarray,
-                  window_size: int = 7,
-                  n_sigmas: float = 3.0) -> np.ndarray:
-    """Remove outliers/spikes with a sliding-window Hampel filter.
+def hampel_mask(signal: np.ndarray,
+               window_size: int = 11,
+               n_sigmas: float = 2.5) -> np.ndarray:
+    """Flag outlier samples using a sliding-window Hampel criterion.
 
-    For each sample, the median and the Median Absolute Deviation (MAD) of a
-    surrounding window are computed. If a sample deviates from the local
-    median by more than `n_sigmas` scaled-MADs, it is replaced by the local
-    median. This is a robust, nonlinear step that targets isolated spikes
-    and short artefact runs (e.g. motion artefacts) without smoothing or
-    phase-shifting the rest of the waveform the way a linear filter would.
+    For each sample, the median and the Median Absolute Deviation (MAD) of
+    a surrounding window are computed. A sample is flagged if it deviates
+    from the local median by more than `n_sigmas` scaled-MADs. Unlike a
+    Hampel *filter*, this function does not alter the signal -- it only
+    returns a boolean mask of which samples look corrupted, so a separate
+    repair step (dilation + interpolation) can act on exactly those
+    samples and nothing else.
 
     Parameters
     ----------
@@ -233,14 +299,15 @@ def hampel_filter(signal: np.ndarray,
         Input samples (typically the raw noisy signal).
     window_size : int
         Size of the sliding window in samples (should be odd; an even
-        value is rounded up internally).
+        value is rounded down to the nearest valid half-window).
     n_sigmas : float
         Rejection threshold in scaled-MAD units.
 
     Returns
     -------
     np.ndarray
-        Signal with outliers replaced by local medians, same length as input.
+        Boolean mask, True where a sample is flagged as an outlier, same
+        length as `signal`.
     """
     signal = np.asarray(signal, dtype=float)
     if signal.ndim != 1:
@@ -251,60 +318,183 @@ def hampel_filter(signal: np.ndarray,
         raise ValueError(f"n_sigmas must be positive, got {n_sigmas}")
 
     n = signal.size
+    mask = np.zeros(n, dtype=bool)
     if n == 0:
-        return signal.copy()
+        return mask
 
-    half_window = max(1, window_size // 2)
+    half = max(1, window_size // 2)
     k = 1.4826  # scale factor so MAD approximates std for Gaussian data
-    cleaned = signal.copy()
 
     for i in range(n):
-        start = max(0, i - half_window)
-        end = min(n, i + half_window + 1)
-        window = signal[start:end]
+        left = max(0, i - half)
+        right = min(n, i + half + 1)
+        window = signal[left:right]
+
         median = np.median(window)
         mad = k * np.median(np.abs(window - median))
         if mad == 0:
             continue
-        if np.abs(signal[i] - median) > n_sigmas * mad:
-            cleaned[i] = median
 
-    return cleaned
+        if abs(signal[i] - median) > n_sigmas * mad:
+            mask[i] = True
+
+    return mask
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 of denoising: Butterworth zero-phase low-pass
+# Stage 2 of the pipeline: repair via PCHIP interpolation over flagged samples
+# ---------------------------------------------------------------------------
+def interpolate_mask(signal: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Replace flagged (masked) samples via PCHIP interpolation.
+
+    Every sample where `mask` is True is discarded and re-estimated from
+    the surrounding "good" samples using a Piecewise Cubic Hermite
+    Interpolating Polynomial (PCHIP). PCHIP is preferred over a cubic
+    spline here because it does not overshoot between points -- important
+    right after a large corrupted region has been removed, where a
+    regular spline can ring and introduce new, artificial extrema.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Input samples, some of which are corrupted.
+    mask : np.ndarray
+        Boolean mask, True where `signal` should be discarded and
+        interpolated over (typically the dilated output of
+        `hampel_mask`). Must be the same length as `signal`.
+
+    Returns
+    -------
+    np.ndarray
+        Signal with flagged samples replaced by interpolated values, same
+        length as input.
+    """
+    signal = np.asarray(signal, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    if signal.ndim != 1:
+        raise ValueError(f"signal must be 1-D, got shape {signal.shape}")
+    if mask.shape != signal.shape:
+        raise ValueError(
+            f"mask must match signal's shape: got {mask.shape} vs {signal.shape}"
+        )
+
+    n = signal.size
+    if n == 0 or not mask.any():
+        return signal.copy()
+
+    good = ~mask
+    if good.sum() < 2:
+        raise ValueError(
+            "fewer than 2 unflagged samples remain -- cannot interpolate; "
+            "loosen the Hampel threshold or reduce dilation"
+        )
+
+    x = np.arange(n)
+    interpolator = PchipInterpolator(x[good], signal[good], extrapolate=True)
+    repaired = signal.copy()
+    repaired[mask] = interpolator(x[mask])
+    return repaired
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 of the pipeline: notch filter (mains interference)
+# ---------------------------------------------------------------------------
+def notch_filter(signal: np.ndarray,
+                 fs: int,
+                 freq: float = 50.0,
+                 q: float = 30.0) -> np.ndarray:
+    """Remove a narrow-band interference tone (mains hum) with a zero-phase
+    IIR notch filter.
+
+    A notch targets the mains frequency specifically, rather than relying
+    on the broader roll-off of the low-pass/band-pass stage that follows.
+    Use `freq=60.0` for recordings made on a 60 Hz mains grid (e.g. North
+    America).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Input samples.
+    fs : int
+        Sampling frequency in Hz.
+    freq : float
+        Frequency to notch out, in Hz (50 for Europe, 60 for the US).
+    q : float
+        Quality factor: higher values give a narrower notch.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered signal, same length as input.
+    """
+    signal = np.asarray(signal, dtype=float)
+    if signal.ndim != 1:
+        raise ValueError(f"signal must be 1-D, got shape {signal.shape}")
+    if fs <= 0:
+        raise ValueError(f"fs must be positive, got {fs}")
+    nyquist = 0.5 * fs
+    if not 0 < freq < nyquist:
+        raise ValueError(
+            f"freq must satisfy 0 < freq < fs/2 (got freq={freq}, fs/2={nyquist})"
+        )
+    if q <= 0:
+        raise ValueError(f"q must be positive, got {q}")
+
+    b, a = iirnotch(freq, q, fs)
+    return filtfilt(b, a, signal)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 of the pipeline: Butterworth zero-phase band-pass
 # ---------------------------------------------------------------------------
 def denoise_signal(noisy_signal: np.ndarray,
                    fs: int = 100,
-                   cutoff_hz: float = 4.0,
+                   low_cutoff_hz: float | None = 0.5,
+                   high_cutoff_hz: float = 3.5,
                    order: int = 4) -> np.ndarray:
-    """Remove the bulk of the broadband/high-frequency noise with a
-    zero-phase Butterworth low-pass.
+    """Remove the bulk of the remaining broadband noise with a zero-phase
+    Butterworth filter, band-pass by default.
 
-    A low-pass filter is well suited to physiological signals whose
-    informative content lies below a few Hz (heart rate, respiration,
-    slow temperature changes), while the dominant remaining noise sources
-    (mains hum, broadband Gaussian/pink noise) sit above the
-    chosen cutoff and are attenuated. Short motion/EMG bursts are only
-    partially reduced here -- that's left for the wavelet stage that
-    follows, which is much easier to tune on an already-smoothed signal.
+    A pure low-pass only rejects energy *above* `high_cutoff_hz`. It does
+    nothing about noise sitting *below* the signal band -- and slow
+    baseline shifts / drift have most of their energy well under a
+    low-pass cutoff, so they sail through a low-pass filter untouched.
+    Turning the filter into a band-pass (`low_cutoff_hz` to
+    `high_cutoff_hz`) closes that gap: with the 1.2 Hz physiological
+    oscillation as the signal of interest, a passband of roughly
+    0.5-3.5 Hz rejects both the high-frequency noise (mains, Gaussian/pink,
+    EMG) *and* the slow drift below the signal band -- including the
+    0.05 Hz baseline drift added to the synthetic "clean" signal itself,
+    which is treated here as slow artefact, not informative content.
 
-    `filtfilt` applies the filter forward and backward to avoid the
-    phase distortion that would shift the waveform in time -- important
-    for diagnostic interpretation.
+    Pass `low_cutoff_hz=None` to fall back to a pure low-pass filter, e.g.
+    for signals where slow baseline wander is part of what you want to
+    keep (temperature trends, slow drug-response curves) rather than
+    noise to reject.
+
+    By the time this stage runs, sharp discontinuities (spikes, baseline
+    shifts, dropouts) have already been repaired by the Hampel-mask +
+    interpolation stage, so `filtfilt` has nothing sharp left to ring on.
 
     Parameters
     ----------
     noisy_signal : np.ndarray
-        Input samples to be cleaned (ideally already passed through
-        `hampel_filter` to remove spikes first).
+        Input samples to be cleaned (ideally already repaired via
+        `hampel_mask` + `interpolate_mask`, and passed through
+        `notch_filter`).
     fs : int
         Sampling frequency of `noisy_signal` in Hz.
-    cutoff_hz : float
-        -3 dB cut-off frequency of the low-pass filter.
+    low_cutoff_hz : float or None
+        Lower -3 dB cut-off of the passband. None disables the high-pass
+        side and falls back to a pure low-pass filter.
+    high_cutoff_hz : float
+        Upper -3 dB cut-off of the passband (or of the low-pass, if
+        `low_cutoff_hz` is None).
     order : int
-        Order of the Butterworth filter.
+        Order of the Butterworth filter. For a band-pass, `scipy.signal.butter`
+        actually returns a filter with 2x this many poles (one low-pass and
+        one high-pass prototype combined), so the effective roll-off is
+        steeper than the same `order` used in low-pass mode.
 
     Returns
     -------
@@ -314,10 +504,15 @@ def denoise_signal(noisy_signal: np.ndarray,
     if fs <= 0:
         raise ValueError(f"fs must be positive, got {fs}")
     nyquist = 0.5 * fs
-    if not 0 < cutoff_hz < nyquist:
+    if not 0 < high_cutoff_hz < nyquist:
         raise ValueError(
-            f"cutoff_hz must satisfy 0 < cutoff_hz < fs/2 "
-            f"(got cutoff_hz={cutoff_hz}, fs/2={nyquist})"
+            f"high_cutoff_hz must satisfy 0 < high_cutoff_hz < fs/2 "
+            f"(got high_cutoff_hz={high_cutoff_hz}, fs/2={nyquist})"
+        )
+    if low_cutoff_hz is not None and not 0 < low_cutoff_hz < high_cutoff_hz:
+        raise ValueError(
+            f"low_cutoff_hz must satisfy 0 < low_cutoff_hz < high_cutoff_hz "
+            f"(got low_cutoff_hz={low_cutoff_hz}, high_cutoff_hz={high_cutoff_hz})"
         )
     if not 1 <= order <= 10:
         # Higher orders quickly become numerically unstable in transfer-function
@@ -333,22 +528,29 @@ def denoise_signal(noisy_signal: np.ndarray,
         # filtfilt propagates a single NaN/Inf to every output sample.
         raise ValueError("noisy_signal contains NaN or Inf -- clean the input first")
 
-    padlen = 3 * (order + 1)
+    if low_cutoff_hz is None:
+        b, a = butter(order, high_cutoff_hz / nyquist, btype="low", analog=False)
+    else:
+        b, a = butter(order, [low_cutoff_hz / nyquist, high_cutoff_hz / nyquist],
+                      btype="band", analog=False)
+
+    # Compute padlen from the actual filter coefficients rather than a fixed
+    # formula -- a band-pass filter of the same `order` has twice as many
+    # coefficients as a low-pass one, so the minimum signal length differs.
+    padlen = 3 * max(len(a), len(b))
     if noisy_signal.size <= padlen:
         raise ValueError(
             f"signal length ({noisy_signal.size}) must exceed "
-            f"3*(order+1) = {padlen} samples for filtfilt; "
+            f"3*max(len(a),len(b)) = {padlen} samples for filtfilt; "
             f"use a longer recording or a lower order"
         )
 
-    normalised_cutoff = cutoff_hz / nyquist
-    b, a = butter(order, normalised_cutoff, btype="low", analog=False)
     cleaned = filtfilt(b, a, noisy_signal)
     return cleaned
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 of denoising: wavelet-domain denoising (residual motion/EMG bursts)
+# Stage 5 of the pipeline: wavelet-domain denoising (residual bursts)
 # ---------------------------------------------------------------------------
 def wavelet_denoise(signal: np.ndarray,
                     noise_reference: np.ndarray | None = None,
@@ -357,12 +559,13 @@ def wavelet_denoise(signal: np.ndarray,
                     mode: str = "soft") -> np.ndarray:
     """Denoise via multi-resolution wavelet shrinkage (VisuShrink-style).
 
-    Run last in the pipeline, after Hampel and Butterworth have already
-    removed spikes and the bulk of the broadband noise. What's left at
-    that point is short, wideband motion/EMG bursts -- exactly what a
-    fixed-window filter (Hampel) or a fixed frequency cutoff (Butterworth)
-    can't isolate on their own, since wavelet decomposition localizes
-    energy in time *and* frequency simultaneously.
+    Run last in the pipeline, after interpolation, notch filtering and
+    Butterworth band-pass have already repaired discontinuities and
+    removed the bulk of the noise. What's left at that point is whatever
+    short, wideband residue survives -- exactly what a fixed-window
+    repair step or a fixed frequency passband can't fully isolate on
+    their own, since wavelet decomposition localizes energy in time *and*
+    frequency simultaneously.
 
     The signal is decomposed with a discrete wavelet transform, the detail
     (high-frequency) coefficients at each level are shrunk with a universal
@@ -374,30 +577,26 @@ def wavelet_denoise(signal: np.ndarray,
     should be smooth.
 
     Threshold estimation is decoupled from what gets filtered: by the time
-    Butterworth has run, the finest wavelet detail coefficients of
-    `signal` are mostly gone, so estimating sigma from `signal` itself
-    yields a threshold too small to do anything useful (the noise floor
-    it's trying to measure has already been removed). Passing
-    `noise_reference` -- the signal *before* Butterworth (i.e. the output
-    of `hampel_filter`), which still has its high frequencies intact --
-    fixes this: sigma is estimated from `noise_reference`'s finest detail
-    coefficients, but that threshold is applied to `signal`'s own
-    coefficients for the actual shrinkage. This keeps the two roles
-    separate -- "how noisy was this signal" vs "what do I shrink" -- so
-    the threshold reflects the genuine noise floor instead of whatever
-    little is left after Butterworth.
+    the notch and Butterworth stages have run, the finest wavelet detail
+    coefficients of `signal` are mostly gone, so estimating sigma from
+    `signal` itself yields a threshold too small to do anything useful.
+    Passing `noise_reference` -- the signal *before* those stages (i.e.
+    the output of `interpolate_mask`), which still has its high
+    frequencies intact -- fixes this: sigma is estimated from
+    `noise_reference`'s finest detail coefficients, but that threshold is
+    applied to `signal`'s own coefficients for the actual shrinkage.
 
     Parameters
     ----------
     signal : np.ndarray
         Input samples to denoise (e.g. output of `denoise_signal`).
     noise_reference : np.ndarray or None
-        Signal to estimate the noise threshold from -- ideally one taken
-        before Butterworth (e.g. the output of `hampel_filter`), since it
-        still carries the high-frequency content the threshold estimate
-        needs. Must be the same length as `signal`. If None, `signal`
-        is used for both roles (matches the old, threshold-collapses-
-        after-Butterworth behaviour -- not recommended in this pipeline).
+        Signal to estimate the noise threshold from -- ideally the output
+        of `interpolate_mask`, taken before the notch/Butterworth stages,
+        since it still carries the high-frequency content the threshold
+        estimate needs. Must be the same length as `signal`. If None,
+        `signal` is used for both roles (not recommended in this
+        pipeline, since the threshold collapses to near zero).
     wavelet : str
         Wavelet family. Smooth, symmetric wavelets such as "sym8", "sym4"
         or "db4" are preferred here: their shape is closer to a
@@ -462,9 +661,9 @@ def wavelet_denoise(signal: np.ndarray,
 
     # Universal (VisuShrink) threshold: noise sigma estimated robustly, via
     # MAD, from the finest-detail coefficients of the *reference* signal
-    # (pre-Butterworth), threshold = sigma * sqrt(2 ln n). This is the
-    # only place `noise_reference` is used -- the shrinkage itself still
-    # operates on `signal`'s own coefficients below.
+    # (pre-notch/pre-Butterworth), threshold = sigma * sqrt(2 ln n). This is
+    # the only place `noise_reference` is used -- the shrinkage itself
+    # still operates on `signal`'s own coefficients below.
     ref_coeffs = pywt.wavedec(noise_reference, wavelet, level=level)
     finest_ref_detail = ref_coeffs[-1]
     sigma = np.median(np.abs(finest_ref_detail)) / 0.6745 if finest_ref_detail.size else 0.0
@@ -478,7 +677,7 @@ def wavelet_denoise(signal: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: quality metric (SNR)
+# Quality metric (SNR)
 # ---------------------------------------------------------------------------
 def compute_snr_db(reference: np.ndarray, test_signal: np.ndarray) -> float:
     """Compute the Signal-to-Noise Ratio, in dB, of `test_signal` against a
@@ -513,19 +712,21 @@ def compute_snr_db(reference: np.ndarray, test_signal: np.ndarray) -> float:
 def plot_results(t: np.ndarray,
                  clean: np.ndarray,
                  noisy: np.ndarray,
-                 hampel_cleaned: np.ndarray,
-                 butterworth_cleaned: np.ndarray,
+                 after_interp: np.ndarray,
+                 after_notch: np.ndarray,
+                 after_butterworth: np.ndarray,
                  final_cleaned: np.ndarray,
                  snr_noisy: float,
-                 snr_hampel: float,
+                 snr_interp: float,
+                 snr_notch: float,
                  snr_butterworth: float,
                  snr_final: float,
                  save_path: str | None = "denoise_demo.png") -> None:
-    """Plot clean / noisy / Hampel-stage / Butterworth-stage / final-stage
-    (wavelet) traces, annotated with the SNR (dB) achieved at each stage,
-    and optionally save to disk.
+    """Plot clean / noisy / repaired / notch / Butterworth / final traces,
+    annotated with the SNR (dB) achieved at each stage, and optionally save
+    to disk.
     """
-    fig, axes = plt.subplots(5, 1, figsize=(11, 11), sharex=True)
+    fig, axes = plt.subplots(6, 1, figsize=(11, 13), sharex=True)
 
     axes[0].plot(t, clean, color="#1b7f3a", linewidth=1.4, label="Clean signal")
     axes[0].set_title("Clean synthetic biosignal (sine + baseline drift)")
@@ -534,37 +735,44 @@ def plot_results(t: np.ndarray,
     axes[0].grid(alpha=0.3)
 
     axes[1].plot(t, noisy, color="#b03030", linewidth=0.8,
-                 label="Noisy (Gaussian + pink + 50 Hz + EMG bursts + motion)")
+                 label="Noisy (Gaussian + pink + 50 Hz + EMG + shifts + dropouts + clipping)")
     axes[1].set_title(f"Noisy signal  |  SNR = {snr_noisy:.2f} dB")
     axes[1].set_ylabel("Amplitude (a.u.)")
-    axes[1].legend(loc="upper right")
+    axes[1].legend(loc="upper right", fontsize=8)
     axes[1].grid(alpha=0.3)
 
-    axes[2].plot(t, hampel_cleaned, color="#c47f00", linewidth=0.9,
-                 label="After Hampel filter (spikes/artefacts removed)")
-    axes[2].set_title(f"Stage 1: Hampel filter  |  SNR = {snr_hampel:.2f} dB")
+    axes[2].plot(t, after_interp, color="#c47f00", linewidth=0.9,
+                 label="After Hampel mask + dilation + PCHIP interpolation")
+    axes[2].set_title(f"Stage 1: Repair (mask + interpolate)  |  SNR = {snr_interp:.2f} dB")
     axes[2].set_ylabel("Amplitude (a.u.)")
-    axes[2].legend(loc="upper right")
+    axes[2].legend(loc="upper right", fontsize=8)
     axes[2].grid(alpha=0.3)
 
-    axes[3].plot(t, butterworth_cleaned, color="#1f4ea1", linewidth=0.9,
-                 label="After Butterworth low-pass (bulk noise removed)")
-    axes[3].set_title(f"Stage 2: Butterworth low-pass (zero-phase)  |  SNR = {snr_butterworth:.2f} dB")
+    axes[3].plot(t, after_notch, color="#a1621f", linewidth=0.9,
+                 label="After 50 Hz notch filter")
+    axes[3].set_title(f"Stage 2: Notch filter (50 Hz)  |  SNR = {snr_notch:.2f} dB")
     axes[3].set_ylabel("Amplitude (a.u.)")
-    axes[3].legend(loc="upper right")
+    axes[3].legend(loc="upper right", fontsize=8)
     axes[3].grid(alpha=0.3)
 
-    axes[4].plot(t, final_cleaned, color="#7a3fa0", linewidth=1.4,
-                 label="After Hampel + Butterworth + wavelet shrinkage")
-    axes[4].plot(t, clean, color="#1b7f3a", linewidth=1.0,
-                 linestyle="--", alpha=0.6, label="Reference (clean)")
-    axes[4].set_title(f"Stage 3: Wavelet shrinkage  |  SNR = {snr_final:.2f} dB")
-    axes[4].set_xlabel("Time (s)")
+    axes[4].plot(t, after_butterworth, color="#1f4ea1", linewidth=0.9,
+                 label="After Butterworth band-pass (0.5-3.5 Hz, zero-phase)")
+    axes[4].set_title(f"Stage 3: Butterworth band-pass  |  SNR = {snr_butterworth:.2f} dB")
     axes[4].set_ylabel("Amplitude (a.u.)")
-    axes[4].legend(loc="upper right")
+    axes[4].legend(loc="upper right", fontsize=8)
     axes[4].grid(alpha=0.3)
 
-    fig.suptitle("Biosignal denoising pipeline: Hampel -> Butterworth -> Wavelet -> SNR",
+    axes[5].plot(t, final_cleaned, color="#7a3fa0", linewidth=1.4,
+                 label="Final: repair + notch + Butterworth + wavelet")
+    axes[5].plot(t, clean, color="#1b7f3a", linewidth=1.0,
+                 linestyle="--", alpha=0.6, label="Reference (clean)")
+    axes[5].set_title(f"Stage 4: Wavelet shrinkage  |  SNR = {snr_final:.2f} dB")
+    axes[5].set_xlabel("Time (s)")
+    axes[5].set_ylabel("Amplitude (a.u.)")
+    axes[5].legend(loc="upper right", fontsize=8)
+    axes[5].grid(alpha=0.3)
+
+    fig.suptitle("Biosignal denoising pipeline: repair -> notch -> Butterworth -> wavelet -> SNR",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
@@ -579,46 +787,56 @@ def plot_results(t: np.ndarray,
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    fs = 100               # sampling frequency in Hz
+    fs = 250              # sampling frequency in Hz (headroom above the 50 Hz notch)
     duration_s = 10.0      # total length of the recording
 
     t, clean = generate_clean_signal(duration_s=duration_s, fs=fs)
     noisy = add_realistic_noise(clean, fs=fs)
 
-    # --- Denoising pipeline: Hampel -> Butterworth -> Wavelet -> SNR ---
-    # Hampel tuned tighter (smaller window, lower sigma threshold) so it
-    # cuts spikes/motion artefacts harder before anything else runs.
-    after_hampel = hampel_filter(noisy, window_size=5, n_sigmas=2.5)
-    # filtfilt is zero-phase (forward+backward), so this stage introduces
-    # no time shift -- safe to use here since this is offline post-processing,
-    # not a real-time/streaming pipeline.
-    after_butterworth = denoise_signal(after_hampel, fs=fs, cutoff_hz=4.0, order=4)
-    # Wavelet runs last, on the already-smoothed signal, targeting the
-    # residual motion/EMG bursts. Shallow decomposition (level=4) and a
-    # smooth mother wavelet (sym8) avoid folding the 1.2 Hz carrier into
-    # the shrunk coefficients; soft thresholding avoids the discontinuities
-    # hard thresholding leaves in the waveform. The noise threshold is
-    # estimated from `after_hampel` (pre-Butterworth), not from the signal
-    # being shrunk itself -- by the time Butterworth has run, the finest
-    # detail coefficients are mostly gone, so measuring the noise floor
-    # from the already-smoothed signal would yield a threshold too small
-    # to do anything.
-    final_cleaned = wavelet_denoise(after_butterworth, noise_reference=after_hampel,
+    # --- Denoising pipeline: repair -> notch -> Butterworth -> wavelet ---
+    # 1) Find outlier samples (spikes, baseline-shift edges) without
+    #    touching the signal yet.
+    mask = hampel_mask(noisy, window_size=11, n_sigmas=2.5)
+    # 2) Grow each flagged region: a real artefact usually corrupts a
+    #    short neighbourhood, not just the single most extreme sample.
+    mask = binary_dilation(mask, iterations=3)
+    # 3) Repair via PCHIP interpolation -- discontinuities are gone before
+    #    any linear filter runs, so nothing is left to "ring" on.
+    after_interp = interpolate_mask(noisy, mask)
+    # 4) Remove 50 Hz mains hum specifically.
+    after_notch = notch_filter(after_interp, fs=fs, freq=50.0, q=30.0)
+    # 5) Band-pass (0.5-3.5 Hz): removes broadband noise on both sides of
+    #    the 1.2 Hz physiological band, including slow baseline drift.
+    #    filtfilt is zero-phase (forward+backward), so this introduces no
+    #    time shift -- safe here since this is offline post-processing,
+    #    not a real-time/streaming pipeline.
+    after_butterworth = denoise_signal(after_notch, fs=fs,
+                                       low_cutoff_hz=0.5, high_cutoff_hz=3.5,
+                                       order=4)
+    # 6) Wavelet shrinkage mops up residual bursts; its noise threshold is
+    #    estimated from `after_interp` (before notch/Butterworth), since
+    #    that's the last point where the signal still has its full
+    #    high-frequency noise character intact.
+    final_cleaned = wavelet_denoise(after_butterworth, noise_reference=after_interp,
                                     wavelet="sym8", level=4, mode="soft")
 
     snr_noisy = compute_snr_db(clean, noisy)
-    snr_hampel = compute_snr_db(clean, after_hampel)
+    snr_interp = compute_snr_db(clean, after_interp)
+    snr_notch = compute_snr_db(clean, after_notch)
     snr_butterworth = compute_snr_db(clean, after_butterworth)
     snr_final = compute_snr_db(clean, final_cleaned)
 
-    print(f"SNR of noisy signal:                            {snr_noisy:6.2f} dB")
-    print(f"SNR after Hampel filter:                         {snr_hampel:6.2f} dB")
-    print(f"SNR after Hampel + Butterworth:                   {snr_butterworth:6.2f} dB")
-    print(f"SNR after Hampel + Butterworth + wavelet:          {snr_final:6.2f} dB")
-    print(f"Total improvement:                               {snr_final - snr_noisy:+.2f} dB")
+    print(f"Samples flagged by Hampel mask (pre-dilation... shown post-dilation): {mask.sum()} / {mask.size}")
+    print(f"SNR of noisy signal:                                {snr_noisy:6.2f} dB")
+    print(f"SNR after repair (mask + interpolate):               {snr_interp:6.2f} dB")
+    print(f"SNR after repair + notch:                            {snr_notch:6.2f} dB")
+    print(f"SNR after repair + notch + Butterworth:               {snr_butterworth:6.2f} dB")
+    print(f"SNR after full pipeline (+ wavelet):                  {snr_final:6.2f} dB")
+    print(f"Total improvement:                                   {snr_final - snr_noisy:+.2f} dB")
 
-    plot_results(t, clean, noisy, after_hampel, after_butterworth, final_cleaned,
-                snr_noisy, snr_hampel, snr_butterworth, snr_final)
+    plot_results(t, clean, noisy, after_interp, after_notch, after_butterworth,
+                final_cleaned, snr_noisy, snr_interp, snr_notch,
+                snr_butterworth, snr_final)
 
 
 if __name__ == "__main__":
