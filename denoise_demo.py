@@ -17,6 +17,21 @@ Improved version incorporating:
 - Configuration via dataclass.
 - Pipeline class with run / plot / metrics / save.
 - Reproducible experiments with seed.
+
+NEW FEATURES:
+- Ground truth overlaid on time‑domain plots.
+- Error signal (difference from ground truth) displayed.
+- Error spectrum (FFT of error) shown.
+- SNR progression bar chart across stages.
+- Automatic Hampel parameter tuning (grid search).
+- Comparison with Savitzky‑Golay, median filter, Wiener, Kalman, plain wavelet.
+- For EXTREME difficulty: multiple runs (30‑100) with different seeds,
+  showing mean and confidence intervals instead of a single lucky run.
+
+FIXED:
+- Hampel parameters adjusted per difficulty (less aggressive for MEDIUM).
+- Dilation reduced for MEDIUM.
+- Ablation study added to quantify contribution of each stage.
 """
 
 from __future__ import annotations
@@ -24,14 +39,16 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 import pywt
-from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt
+from scipy.signal import butter, sosfiltfilt, iirnotch, savgol_filter, medfilt, wiener
 from scipy.ndimage import binary_dilation
 from scipy.interpolate import PchipInterpolator, CubicSpline
 from scipy import signal
+from scipy.stats import sem, t
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple, List, Dict, Any
 import warnings
+import itertools
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +86,7 @@ class PipelineConfig:
     dropout_flatline_noise_amp: float = 0.02
     clip_limit: Optional[float] = 3.0
 
-    # Pipeline parameters
+    # Pipeline parameters (will be adjusted per difficulty)
     hampel_window_sec: float = 0.1    # 100 ms
     hampel_n_sigmas: float = 2.0
     dilation_sec: float = 0.02        # 20 ms
@@ -84,7 +101,7 @@ class PipelineConfig:
 
     # Experiment
     seed: int = 42
-    difficulty: Difficulty = Difficulty.EXTREME
+    difficulty: Difficulty = Difficulty.MEDIUM
     n_repeats: int = 1               # number of noise realisations to average
 
     def __post_init__(self):
@@ -99,6 +116,10 @@ class PipelineConfig:
             self.baseline_shift_count = 0
             self.dropout_count = 0
             self.clip_limit = None
+            # Hampel: very mild
+            self.hampel_window_sec = 0.05
+            self.hampel_n_sigmas = 5.0
+            self.dilation_sec = 0.01
         elif self.difficulty == Difficulty.MEDIUM:
             self.gaussian_amp = 0.15
             self.pink_amp = 0.12
@@ -109,6 +130,10 @@ class PipelineConfig:
             self.baseline_shift_count = 0
             self.dropout_count = 1
             self.clip_limit = 4.0
+            # Less aggressive Hampel
+            self.hampel_window_sec = 0.12
+            self.hampel_n_sigmas = 3.0
+            self.dilation_sec = 0.01
         elif self.difficulty == Difficulty.HARD:
             self.gaussian_amp = 0.2
             self.pink_amp = 0.18
@@ -119,7 +144,10 @@ class PipelineConfig:
             self.baseline_shift_count = 2
             self.dropout_count = 2
             self.clip_limit = 3.5
-        # EXTREME keeps the default values
+            self.hampel_window_sec = 0.1
+            self.hampel_n_sigmas = 2.5
+            self.dilation_sec = 0.02
+        # EXTREME keeps the default values (0.1, 2.0, 0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -398,23 +426,18 @@ def interpolate_mask_adaptive(signal: np.ndarray,
             method = 'linear'
 
         # Find good samples around the gap
-        # We need at least 2 points on each side for interpolation, but we can use all good.
         good_idx = np.where(~mask)[0]
         if len(good_idx) < 2:
-            # Not enough good samples, fallback to linear interpolation with boundaries
             method = 'linear'
-        # Use all good points
         x_good = good_idx
         y_good = signal[good_idx]
         if len(x_good) < 2:
-            # Cannot interpolate, leave as is (or NaN)
             continue
 
         if method == 'pchip':
             interp = PchipInterpolator(x_good, y_good, extrapolate=True)
             repaired[start:end] = interp(np.arange(start, end))
         elif method == 'cubic':
-            # CubicSpline requires at least 4 points, if not enough fallback to pchip
             if len(x_good) >= 4:
                 interp = CubicSpline(x_good, y_good, extrapolate=True)
                 repaired[start:end] = interp(np.arange(start, end))
@@ -422,7 +445,6 @@ def interpolate_mask_adaptive(signal: np.ndarray,
                 interp = PchipInterpolator(x_good, y_good, extrapolate=True)
                 repaired[start:end] = interp(np.arange(start, end))
         else:  # linear
-            # Use linear interpolation (np.interp works with any number of points)
             repaired[start:end] = np.interp(np.arange(start, end), x_good, y_good)
 
     return repaired
@@ -433,7 +455,6 @@ def notch_filter_sos(x: np.ndarray, fs: int, freq: float, q: float = 30.0) -> np
     nyquist = 0.5 * fs
     if not 0 < freq < nyquist:
         raise ValueError(f"freq must be 0 < freq < fs/2")
-    # Use iirnotch to get b,a, then convert to sos
     b, a = iirnotch(freq, q, fs)
     sos = signal.tf2sos(b, a)
     return sosfiltfilt(sos, x)
@@ -479,17 +500,14 @@ def wavelet_denoise_bayes(signal: np.ndarray,
     if n == 0:
         return signal.copy()
 
-    # Determine decomposition level
     max_level = pywt.dwt_max_level(n, pywt.Wavelet(wavelet).dec_len)
     if max_level < 1:
         raise ValueError("signal too short for wavelet")
     level = min(level, max_level)
 
-    # Decompose signal
     coeffs = pywt.wavedec(signal, wavelet, level=level)
     details = coeffs[1:]
 
-    # Estimate noise sigma from reference or from signal's finest detail
     if noise_reference is not None:
         ref_coeffs = pywt.wavedec(noise_reference, wavelet, level=level)
         finest = ref_coeffs[-1]
@@ -497,20 +515,16 @@ def wavelet_denoise_bayes(signal: np.ndarray,
         finest = details[-1]
     sigma = np.median(np.abs(finest)) / 0.6745 if finest.size else 0.0
 
-    # BayesShrink: threshold per level = sigma^2 / sigma_x
-    # sigma_x estimated from detail coefficients at that level
     denoised_details = []
     for d in details:
         if sigma == 0 or d.size == 0:
             denoised_details.append(d)
             continue
-        # Estimate sigma_x from coefficients (robust)
         sigma_x = np.sqrt(np.mean(d ** 2))
         if sigma_x < 1e-12:
             denoised_details.append(d)
             continue
         thr = (sigma ** 2) / sigma_x
-        # Apply soft threshold
         denoised_details.append(pywt.threshold(d, value=thr, mode=mode))
     denoised_coeffs = [coeffs[0]] + denoised_details
     reconstructed = pywt.waverec(denoised_coeffs, wavelet)
@@ -559,14 +573,19 @@ class DenoisingPipeline:
         self.noisy = noise_gen.corrupt(self.clean_observed, cfg)
 
         # ---- Pipeline stages ----
-        # 1. Hampel mask
-        mask = hampel_mask(self.noisy, cfg.hampel_window_sec, cfg.hampel_n_sigmas, fs)
-        # 2. Dilation
-        dilation_samples = int(cfg.dilation_sec * fs)
-        if dilation_samples > 0:
-            mask = binary_dilation(mask, iterations=dilation_samples)
-        # 3. Adaptive interpolation
-        after_interp = interpolate_mask_adaptive(self.noisy, mask, fs)
+        # 1. Hampel mask (skip if window_sec <= 0 or n_sigmas too large)
+        if cfg.hampel_window_sec > 0 and cfg.hampel_n_sigmas < 10:
+            mask = hampel_mask(self.noisy, cfg.hampel_window_sec, cfg.hampel_n_sigmas, fs)
+            # 2. Dilation
+            dilation_samples = int(cfg.dilation_sec * fs)
+            if dilation_samples > 0:
+                mask = binary_dilation(mask, iterations=dilation_samples)
+            # 3. Adaptive interpolation
+            after_interp = interpolate_mask_adaptive(self.noisy, mask, fs)
+        else:
+            # Skip repair
+            after_interp = self.noisy.copy()
+
         # 4. Notch
         after_notch = notch_filter_sos(after_interp, fs, cfg.notch_freq, cfg.notch_q)
         # 5. Butterworth bandpass
@@ -594,6 +613,82 @@ class DenoisingPipeline:
         # Compute metrics against true signal (not baseline)
         for res in self.results:
             res.metrics = compute_all_metrics(self.true_signal, res.signal)
+
+    def run_custom_pipeline(self, enable_hampel: bool = True,
+                            enable_notch: bool = True,
+                            enable_butter: bool = True,
+                            enable_wavelet: bool = True) -> np.ndarray:
+        """
+        Apply a subset of pipeline stages to the already noisy signal (self.noisy).
+        Returns the signal after the last enabled stage.
+        """
+        if self.noisy is None or self.true_signal is None:
+            raise RuntimeError("Run run() first to generate data.")
+
+        signal = self.noisy.copy()
+        cfg = self.config
+        fs = cfg.fs
+
+        # Stage 1: Hampel + interpolation (including dilation)
+        if enable_hampel and cfg.hampel_window_sec > 0 and cfg.hampel_n_sigmas < 10:
+            mask = hampel_mask(signal, cfg.hampel_window_sec, cfg.hampel_n_sigmas, fs)
+            dilation_samples = int(cfg.dilation_sec * fs)
+            if dilation_samples > 0:
+                mask = binary_dilation(mask, iterations=dilation_samples)
+            signal = interpolate_mask_adaptive(signal, mask, fs)
+
+        # Stage 2: Notch
+        if enable_notch:
+            signal = notch_filter_sos(signal, fs, cfg.notch_freq, cfg.notch_q)
+
+        # Stage 3: Butterworth bandpass
+        if enable_butter:
+            signal = butter_bandpass_sos(signal, fs, cfg.bandpass_low,
+                                         cfg.bandpass_high, cfg.butter_order)
+
+        # Stage 4: Wavelet
+        if enable_wavelet:
+            # Use current signal as noise reference (as in full pipeline)
+            signal = wavelet_denoise_bayes(
+                signal,
+                noise_reference=signal,
+                wavelet=cfg.wavelet_name,
+                level=cfg.wavelet_level,
+                mode=cfg.wavelet_mode
+            )
+
+        return signal
+
+    def ablation_study(self, combinations: Optional[List[Tuple[bool, bool, bool, bool]]] = None) -> None:
+        """
+        Perform ablation study: for each combination of stages, compute final SNR.
+        If combinations is None, all 16 combinations are tested.
+        """
+        if self.noisy is None:
+            raise RuntimeError("Run run() first to generate data.")
+
+        if combinations is None:
+            combinations = list(itertools.product([True, False], repeat=4))
+
+        print("\n=== Ablation Study ===")
+        print(f"{'Hampel':<8} {'Notch':<8} {'Butter':<8} {'Wavelet':<8} {'SNR (dB)':>12}")
+        print("-" * 50)
+
+        results = []
+        for (h, n, b, w) in combinations:
+            # Skip the combination where all are disabled (no processing)
+            if not any([h, n, b, w]):
+                continue
+            sig = self.run_custom_pipeline(enable_hampel=h, enable_notch=n,
+                                           enable_butter=b, enable_wavelet=w)
+            snr = compute_snr_db(self.true_signal, sig)
+            results.append((h, n, b, w, snr))
+            print(f"{str(h):<8} {str(n):<8} {str(b):<8} {str(w):<8} {snr:>12.2f}")
+
+        if results:
+            best = max(results, key=lambda x: x[4])
+            print("-" * 50)
+            print(f"Best combination: Hampel={best[0]}, Notch={best[1]}, Butter={best[2]}, Wavelet={best[3]}  SNR={best[4]:.2f} dB")
 
     def get_metrics_dataframe(self) -> Dict[str, Dict[str, float]]:
         """Return metrics as nested dict: stage -> metric -> value."""
@@ -637,49 +732,67 @@ class DenoisingPipeline:
         print("=" * 70)
 
     def plot(self, save_path: Optional[str] = None) -> None:
-        """Plot time-domain signals, FFT, and PSD for each stage."""
+        """
+        Enhanced plot: time domain (with ground truth), error signal,
+        FFT of signal, and PSD of signal.
+        """
         cfg = self.config
         t = np.arange(self.noisy.size) / cfg.fs
 
-        # Figure layout: 5 rows (stages) x 3 columns (time, FFT, PSD)
-        fig, axes = plt.subplots(len(self.results), 3, figsize=(15, 3*len(self.results)))
+        n_stages = len(self.results)
+        fig, axes = plt.subplots(n_stages, 4, figsize=(16, 3 * n_stages))
         fig.suptitle(f"Denoising pipeline - Difficulty: {cfg.difficulty.value}", fontsize=14)
 
         for i, res in enumerate(self.results):
             signal_data = res.signal
-            # Time domain
+            error = signal_data - self.true_signal
+
+            # Time domain with ground truth
             ax_time = axes[i, 0]
-            ax_time.plot(t, signal_data, lw=0.8, color=f'C{i}')
-            if i == 0:
-                ax_time.set_title("Time domain")
+            ax_time.plot(t, signal_data, lw=0.8, color=f'C{i}', label='Signal')
+            ax_time.plot(t, self.true_signal, lw=0.8, color='k', linestyle='--', alpha=0.6, label='Ground truth')
             ax_time.set_ylabel("Amplitude")
             ax_time.grid(alpha=0.3)
-            if i == len(self.results)-1:
-                ax_time.set_xlabel("Time (s)")
-
-            # FFT magnitude
-            ax_fft = axes[i, 1]
-            fft_vals = np.fft.rfft(signal_data)
-            freqs = np.fft.rfftfreq(signal_data.size, 1/cfg.fs)
-            ax_fft.plot(freqs, np.abs(fft_vals), lw=0.8, color=f'C{i}')
-            ax_fft.set_xlim(0, cfg.fs/2)
             if i == 0:
-                ax_fft.set_title("FFT magnitude")
+                ax_time.set_title("Time domain")
+            if i == n_stages - 1:
+                ax_time.set_xlabel("Time (s)")
+            if i == 0:
+                ax_time.legend(loc='upper right', fontsize=8)
+
+            # Error signal (time domain)
+            ax_err = axes[i, 1]
+            ax_err.plot(t, error, lw=0.8, color='r')
+            ax_err.set_ylabel("Error")
+            ax_err.grid(alpha=0.3)
+            if i == 0:
+                ax_err.set_title("Error signal")
+            if i == n_stages - 1:
+                ax_err.set_xlabel("Time (s)")
+
+            # FFT magnitude of signal
+            ax_fft = axes[i, 2]
+            fft_vals = np.fft.rfft(signal_data)
+            freqs = np.fft.rfftfreq(signal_data.size, 1 / cfg.fs)
+            ax_fft.plot(freqs, np.abs(fft_vals), lw=0.8, color=f'C{i}')
+            ax_fft.set_xlim(0, cfg.fs / 2)
             ax_fft.set_ylabel("Magnitude")
             ax_fft.grid(alpha=0.3)
-            if i == len(self.results)-1:
+            if i == 0:
+                ax_fft.set_title("FFT signal")
+            if i == n_stages - 1:
                 ax_fft.set_xlabel("Frequency (Hz)")
 
-            # PSD (Welch)
-            ax_psd = axes[i, 2]
-            f, Pxx = signal.welch(signal_data, cfg.fs, nperseg=min(256, signal_data.size//2))
+            # PSD of signal (Welch)
+            ax_psd = axes[i, 3]
+            f, Pxx = signal.welch(signal_data, cfg.fs, nperseg=min(256, signal_data.size // 2))
             ax_psd.semilogy(f, Pxx, lw=0.8, color=f'C{i}')
-            ax_psd.set_xlim(0, cfg.fs/2)
-            if i == 0:
-                ax_psd.set_title("PSD (Welch)")
+            ax_psd.set_xlim(0, cfg.fs / 2)
             ax_psd.set_ylabel("Power")
             ax_psd.grid(alpha=0.3)
-            if i == len(self.results)-1:
+            if i == 0:
+                ax_psd.set_title("PSD signal")
+            if i == n_stages - 1:
                 ax_psd.set_xlabel("Frequency (Hz)")
 
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -687,6 +800,190 @@ class DenoisingPipeline:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
             print(f"Plot saved to: {save_path}")
         plt.show()
+
+    def plot_error_spectrum(self, save_path: Optional[str] = None) -> None:
+        """Plot the FFT magnitude of the error signal for each stage."""
+        cfg = self.config
+        n_stages = len(self.results)
+        fig, axes = plt.subplots(n_stages, 1, figsize=(10, 2.5 * n_stages))
+        fig.suptitle("Error spectrum (FFT of signal - ground truth)", fontsize=14)
+
+        for i, res in enumerate(self.results):
+            error = res.signal - self.true_signal
+            fft_err = np.fft.rfft(error)
+            freqs = np.fft.rfftfreq(error.size, 1 / cfg.fs)
+            axes[i].plot(freqs, np.abs(fft_err), lw=0.8, color='r')
+            axes[i].set_xlim(0, cfg.fs / 2)
+            axes[i].set_ylabel("Magnitude")
+            axes[i].grid(alpha=0.3)
+            axes[i].set_title(res.name)
+        axes[-1].set_xlabel("Frequency (Hz)")
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"Error spectrum plot saved to: {save_path}")
+        plt.show()
+
+    def plot_snr_progression(self, save_path: Optional[str] = None) -> None:
+        """Bar plot of SNR per stage."""
+        stage_names = [res.name for res in self.results]
+        snr_vals = [res.metrics["SNR (dB)"] for res in self.results]
+        deltas = [0] + [snr_vals[i] - snr_vals[i-1] for i in range(1, len(snr_vals))]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig.suptitle("SNR progression through stages", fontsize=14)
+
+        ax1.bar(stage_names, snr_vals, color='skyblue')
+        ax1.set_ylabel("SNR (dB)")
+        ax1.set_xticks(range(len(stage_names)))
+        ax1.set_xticklabels(stage_names, rotation=15)
+        ax1.grid(axis='y', alpha=0.3)
+        for i, v in enumerate(snr_vals):
+            ax1.text(i, v + 0.2, f"{v:.1f}", ha='center', va='bottom', fontsize=9)
+
+        ax2.bar(stage_names, deltas, color='orange')
+        ax2.set_ylabel("Δ SNR (dB)")
+        ax2.set_xticks(range(len(stage_names)))
+        ax2.set_xticklabels(stage_names, rotation=15)
+        ax2.grid(axis='y', alpha=0.3)
+        for i, v in enumerate(deltas):
+            ax2.text(i, v + (0.1 if v >= 0 else -0.3), f"{v:+.1f}", ha='center', va='bottom' if v >= 0 else 'top', fontsize=9)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"SNR progression plot saved to: {save_path}")
+        plt.show()
+
+    def tune_hampel(self, grid_window_sec: Optional[List[float]] = None,
+                    grid_n_sigmas: Optional[List[float]] = None) -> None:
+        """
+        Automatically tune Hampel parameters using grid search.
+        Optimizes SNR of the signal after interpolation (repair stage).
+        """
+        if grid_window_sec is None:
+            grid_window_sec = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3]
+        if grid_n_sigmas is None:
+            grid_n_sigmas = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
+
+        cfg = self.config
+        fs = cfg.fs
+        # Generate data (same as run) but with fixed seed
+        rng = np.random.default_rng(cfg.seed)
+        noise_gen = NoiseGenerator(fs, rng)
+        true_signal = generate_true_signal(cfg.duration_s, fs, cfg.signal_freq)
+        baseline = generate_baseline(cfg.duration_s, fs, cfg.baseline_freq)
+        clean = true_signal + baseline
+        noisy = noise_gen.corrupt(clean, cfg)
+
+        best_snr = -np.inf
+        best_params = (cfg.hampel_window_sec, cfg.hampel_n_sigmas)
+
+        for win_sec, n_sig in itertools.product(grid_window_sec, grid_n_sigmas):
+            mask = hampel_mask(noisy, win_sec, n_sig, fs)
+            dilation_samples = int(cfg.dilation_sec * fs)
+            if dilation_samples > 0:
+                mask = binary_dilation(mask, iterations=dilation_samples)
+            after_interp = interpolate_mask_adaptive(noisy, mask, fs)
+            snr = compute_snr_db(true_signal, after_interp)
+            if snr > best_snr:
+                best_snr = snr
+                best_params = (win_sec, n_sig)
+
+        self.config.hampel_window_sec, self.config.hampel_n_sigmas = best_params
+        print(f"Tuned Hampel parameters: window={best_params[0]:.3f}s, n_sigmas={best_params[1]:.2f} (SNR={best_snr:.2f} dB)")
+
+    def compare_methods(self) -> Dict[str, Dict[str, float]]:
+        """
+        Compare the proposed pipeline with other denoising methods.
+        Returns a dict with method names as keys and metrics as values.
+        Methods: Savitzky-Golay, median filter, Wiener, Kalman, plain wavelet.
+        """
+        cfg = self.config
+        fs = cfg.fs
+        # We need the noisy signal and ground truth (must have run() first)
+        if self.noisy is None or self.true_signal is None:
+            raise RuntimeError("Run the pipeline first (call run())")
+
+        noisy = self.noisy.copy()
+        true_sig = self.true_signal
+        t = np.arange(noisy.size) / fs
+
+        results = {}
+
+        # 1. Savitzky-Golay
+        sg_window = int(0.1 * fs)  # 100 ms window
+        if sg_window % 2 == 0:
+            sg_window += 1
+        sg_denoised = savgol_filter(noisy, window_length=sg_window, polyorder=3)
+        results["Savitzky-Golay"] = compute_all_metrics(true_sig, sg_denoised)
+
+        # 2. Median filter
+        med_window = int(0.05 * fs)  # 50 ms
+        if med_window % 2 == 0:
+            med_window += 1
+        med_denoised = medfilt(noisy, kernel_size=med_window)
+        results["Median filter"] = compute_all_metrics(true_sig, med_denoised)
+
+        # 3. Wiener filter
+        wiener_window = int(0.1 * fs)
+        if wiener_window % 2 == 0:
+            wiener_window += 1
+        wiener_denoised = wiener(noisy, mysize=wiener_window)
+        results["Wiener"] = compute_all_metrics(true_sig, wiener_denoised)
+
+        # 4. Kalman filter (simple 1D with constant velocity)
+        kalman_denoised = self._apply_kalman(noisy)
+        results["Kalman"] = compute_all_metrics(true_sig, kalman_denoised)
+
+        # 5. Plain wavelet (without other preprocessing)
+        wave_denoised = wavelet_denoise_bayes(
+            noisy, noise_reference=None,
+            wavelet=cfg.wavelet_name,
+            level=cfg.wavelet_level,
+            mode=cfg.wavelet_mode
+        )
+        results["Plain wavelet"] = compute_all_metrics(true_sig, wave_denoised)
+
+        # 6. Our full pipeline (final stage)
+        final_signal = self.results[-1].signal
+        results["Full pipeline"] = compute_all_metrics(true_sig, final_signal)
+
+        return results
+
+    def _apply_kalman(self, signal: np.ndarray) -> np.ndarray:
+        """
+        Simple 1D Kalman filter with constant velocity model.
+        State: [position, velocity].
+        """
+        dt = 1.0 / self.config.fs
+        # State transition matrix
+        F = np.array([[1, dt],
+                      [0, 1]])
+        # Observation matrix
+        H = np.array([[1, 0]])
+        # Process noise covariance
+        Q = np.array([[0.01, 0],
+                      [0, 0.01]])
+        # Measurement noise covariance
+        R = np.array([[0.1]])
+
+        x = np.array([[signal[0]], [0]])  # initial state
+        P = np.eye(2) * 1.0
+
+        filtered = np.zeros_like(signal)
+        for k, z in enumerate(signal):
+            # Predict
+            x = F @ x
+            P = F @ P @ F.T + Q
+            # Update
+            y = z - (H @ x)[0, 0]
+            S = H @ P @ H.T + R
+            K = P @ H.T / S[0, 0]
+            x = x + K * y
+            P = (np.eye(2) - K @ H) @ P
+            filtered[k] = x[0, 0]
+        return filtered
 
     def save_results(self, path_prefix: str) -> None:
         """Save stage signals and metrics to disk."""
@@ -696,7 +993,6 @@ class DenoisingPipeline:
                  clean_observed=self.clean_observed,
                  noisy=self.noisy,
                  **{res.name.replace(" ", "_"): res.signal for res in self.results})
-        # Save metrics as CSV-like text
         with open(f"{path_prefix}_metrics.txt", "w") as f:
             f.write("Stage, " + ", ".join(self.results[0].metrics.keys()) + "\n")
             for res in self.results:
@@ -705,42 +1001,215 @@ class DenoisingPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Helper functions for comparison and multiple runs
+# ---------------------------------------------------------------------------
+def compare_methods_on_signal(noisy: np.ndarray, true_signal: np.ndarray, fs: int,
+                              config: PipelineConfig) -> Dict[str, Dict[str, float]]:
+    """
+    Standalone function to compare denoising methods given noisy signal and ground truth.
+    Useful for multiple runs.
+    """
+    results = {}
+
+    # Savitzky-Golay
+    sg_window = int(0.1 * fs)
+    if sg_window % 2 == 0:
+        sg_window += 1
+    sg_denoised = savgol_filter(noisy, window_length=sg_window, polyorder=3)
+    results["Savitzky-Golay"] = compute_all_metrics(true_signal, sg_denoised)
+
+    # Median
+    med_window = int(0.05 * fs)
+    if med_window % 2 == 0:
+        med_window += 1
+    med_denoised = medfilt(noisy, kernel_size=med_window)
+    results["Median filter"] = compute_all_metrics(true_signal, med_denoised)
+
+    # Wiener
+    wiener_window = int(0.1 * fs)
+    if wiener_window % 2 == 0:
+        wiener_window += 1
+    wiener_denoised = wiener(noisy, mysize=wiener_window)
+    results["Wiener"] = compute_all_metrics(true_signal, wiener_denoised)
+
+    # Kalman (simple)
+    dt = 1.0 / fs
+    F = np.array([[1, dt], [0, 1]])
+    H = np.array([[1, 0]])
+    Q = np.array([[0.01, 0], [0, 0.01]])
+    R = np.array([[0.1]])
+    x = np.array([[noisy[0]], [0]])
+    P = np.eye(2) * 1.0
+    kalman_out = np.zeros_like(noisy)
+    for k, z in enumerate(noisy):
+        x = F @ x
+        P = F @ P @ F.T + Q
+        y = z - (H @ x)[0, 0]
+        S = H @ P @ H.T + R
+        K = P @ H.T / S[0, 0]
+        x = x + K * y
+        P = (np.eye(2) - K @ H) @ P
+        kalman_out[k] = x[0, 0]
+    results["Kalman"] = compute_all_metrics(true_signal, kalman_out)
+
+    # Plain wavelet
+    wave_denoised = wavelet_denoise_bayes(
+        noisy, noise_reference=None,
+        wavelet=config.wavelet_name,
+        level=config.wavelet_level,
+        mode=config.wavelet_mode
+    )
+    results["Plain wavelet"] = compute_all_metrics(true_signal, wave_denoised)
+
+    # Our full pipeline (run once with current config, but we need the final output)
+    tmp_pipe = DenoisingPipeline(config)
+    tmp_pipe.noisy = noisy
+    tmp_pipe.true_signal = true_signal
+    fs_cfg = config.fs
+    mask = hampel_mask(noisy, config.hampel_window_sec, config.hampel_n_sigmas, fs_cfg)
+    dilation_samples = int(config.dilation_sec * fs_cfg)
+    if dilation_samples > 0:
+        mask = binary_dilation(mask, iterations=dilation_samples)
+    after_interp = interpolate_mask_adaptive(noisy, mask, fs_cfg)
+    after_notch = notch_filter_sos(after_interp, fs_cfg, config.notch_freq, config.notch_q)
+    after_butter = butter_bandpass_sos(after_notch, fs_cfg, config.bandpass_low,
+                                       config.bandpass_high, config.butter_order)
+    final = wavelet_denoise_bayes(after_butter, noise_reference=after_interp,
+                                  wavelet=config.wavelet_name,
+                                  level=config.wavelet_level,
+                                  mode=config.wavelet_mode)
+    results["Full pipeline"] = compute_all_metrics(true_signal, final)
+
+    return results
+
+
+def run_multiple_extreme(config: PipelineConfig, n_runs: int = 50) -> None:
+    """
+    Run the pipeline multiple times with different seeds for EXTREME difficulty.
+    Prints mean metrics and 95% confidence intervals for the final stage.
+    """
+    print(f"Running {n_runs} repetitions for EXTREME difficulty...")
+    all_final_metrics = []      # list of dicts
+    all_stage_snrs = []         # list of lists: [snr_stage0, snr_stage1, ...]
+
+    for i in range(n_runs):
+        cfg = PipelineConfig(**{**config.__dict__, "seed": config.seed + i})
+        pipe = DenoisingPipeline(cfg)
+        pipe.run()
+        # Get metrics of final stage
+        final_metrics = pipe.results[-1].metrics
+        all_final_metrics.append(final_metrics)
+        # Collect SNR per stage
+        snr_vals = [res.metrics["SNR (dB)"] for res in pipe.results]
+        all_stage_snrs.append(snr_vals)
+
+    # Compute mean and 95% CI for final stage metrics
+    metric_names = list(all_final_metrics[0].keys())
+    metric_values = {name: [m[name] for m in all_final_metrics] for name in metric_names}
+
+    mean_metrics = {}
+    ci_metrics = {}
+    for name in metric_names:
+        vals = metric_values[name]
+        mean_val = np.mean(vals)
+        sem_val = sem(vals)
+        ci = t.interval(0.95, len(vals)-1, loc=mean_val, scale=sem_val)
+        mean_metrics[name] = mean_val
+        ci_metrics[name] = ci
+
+    print("\n=== Final stage metrics over {} runs (EXTREME) ===".format(n_runs))
+    for name in metric_names:
+        print(f"{name}: mean = {mean_metrics[name]:.3f}, 95% CI = [{ci_metrics[name][0]:.3f}, {ci_metrics[name][1]:.3f}]")
+
+    # Plot SNR progression with error bars (across runs)
+    stage_names = ["Raw noisy", "After repair", "After notch", "After Butterworth", "Final (wavelet)"]
+    all_snr = np.array(all_stage_snrs)  # shape (n_runs, n_stages)
+    mean_snr = np.mean(all_snr, axis=0)
+    sem_snr = sem(all_snr, axis=0)
+    ci_snr = t.interval(0.95, n_runs-1, loc=mean_snr, scale=sem_snr)
+
+    plt.figure(figsize=(10, 6))
+    x = np.arange(len(stage_names))
+    plt.errorbar(x, mean_snr, yerr=(mean_snr - ci_snr[0], ci_snr[1] - mean_snr),
+                 fmt='o-', capsize=5, color='blue', ecolor='gray')
+    plt.xticks(x, stage_names, rotation=15)
+    plt.ylabel("SNR (dB)")
+    plt.title(f"SNR progression across stages (EXTREME, {n_runs} runs) with 95% CI")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("snr_progression_extreme.png", dpi=150)
+    plt.show()
+
+    # Also plot distribution of final SNR
+    final_snr = all_snr[:, -1]
+    plt.figure(figsize=(8, 5))
+    plt.hist(final_snr, bins=20, alpha=0.7, color='green', edgecolor='black')
+    plt.axvline(np.mean(final_snr), color='red', linestyle='--', label=f"mean = {np.mean(final_snr):.2f} dB")
+    plt.xlabel("Final SNR (dB)")
+    plt.ylabel("Frequency")
+    plt.title(f"Distribution of final SNR over {n_runs} runs (EXTREME)")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig("final_snr_distribution_extreme.png", dpi=150)
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
 # Main entry point (demo)
 # ---------------------------------------------------------------------------
 def main():
-    # Create configuration (adjust difficulty here)
+    # Create configuration
     config = PipelineConfig(
         duration_s=10.0,
         fs=250,
-        difficulty=Difficulty.EXTREME,  # change to EASY, MEDIUM, HARD, EXTREME
+        difficulty=Difficulty.MEDIUM,  # change to EASY, MEDIUM, HARD, EXTREME
         seed=42,
-        n_repeats=1  # for simplicity we run once, but could loop
+        n_repeats=1
     )
 
-    # Optionally run multiple repeats and average metrics
-    if config.n_repeats > 1:
-        all_metrics = []
-        for seed_offset in range(config.n_repeats):
-            cfg = PipelineConfig(**{**config.__dict__, "seed": config.seed + seed_offset})
-            pipe = DenoisingPipeline(cfg)
-            pipe.run()
-            all_metrics.append(pipe.get_metrics_dataframe())
-        # Average metrics across repeats
-        avg_metrics = {}
-        for stage_name in all_metrics[0].keys():
-            avg_metrics[stage_name] = {}
-            for metric in all_metrics[0][stage_name].keys():
-                vals = [m[stage_name][metric] for m in all_metrics]
-                avg_metrics[stage_name][metric] = np.mean(vals)
-        print("Average metrics over {} repeats:".format(config.n_repeats))
-        for stage, mets in avg_metrics.items():
-            print(f"  {stage}: {mets}")
-    else:
-        pipe = DenoisingPipeline(config)
-        pipe.run()
-        pipe.print_summary()
-        pipe.plot(save_path="denoise_demo_improved.png")
-        pipe.save_results("denoise_demo_results")
+    # If EXTREME, run multiple repetitions
+    if config.difficulty == Difficulty.EXTREME:
+        run_multiple_extreme(config, n_runs=50)
+        return
+
+    # For other difficulties, run a single pipeline
+    pipe = DenoisingPipeline(config)
+
+    # Optional: tune Hampel parameters (uncomment to enable)
+    # pipe.tune_hampel()
+
+    pipe.run()
+    pipe.print_summary()
+
+    # Enhanced plots
+    pipe.plot(save_path="denoise_demo_plot.png")
+    pipe.plot_error_spectrum(save_path="denoise_demo_error_spectrum.png")
+    pipe.plot_snr_progression(save_path="denoise_demo_snr_progression.png")
+
+    # Compare methods
+    print("\n=== Comparison with other methods ===")
+    comp_results = pipe.compare_methods()
+    # Print table
+    methods = list(comp_results.keys())
+    metrics = list(comp_results[methods[0]].keys())
+    print(f"{'Method':<20}", end="")
+    for m in metrics:
+        print(f"{m:>12}", end="")
+    print()
+    for meth in methods:
+        print(f"{meth:<20}", end="")
+        for m in metrics:
+            val = comp_results[meth][m]
+            if "SNR" in m or "PSNR" in m:
+                print(f"{val:>12.2f}", end="")
+            else:
+                print(f"{val:>12.4f}", end="")
+        print()
+
+    # Ablation study (runs automatically for non‑EXTREME)
+    pipe.ablation_study()
+
+    pipe.save_results("denoise_demo_results")
 
 
 if __name__ == "__main__":
